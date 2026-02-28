@@ -4,11 +4,15 @@ import math
 import sys
 
 sys.path.insert(1, r'/wd/Optical_matrix_multiplication')
-import source
+try:
+    import source
+except ImportError:
+    source = None
+    
 pixel_size = 3.6e-6
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 if torch.cuda.is_available():
-    torch.cuda.set_device(1)
+    torch.cuda.set_device(0)
 
 def optics_matmul(sim, tensor_1, tensor_2):
     # Шаг 0: Дополняем размерность
