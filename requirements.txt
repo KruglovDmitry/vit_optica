@@ -4,6 +4,7 @@ torchvision>=0.15.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 tqdm>=4.65.0
+scipy>=1.17.1
 
 # Для логирования и визуализации
 tensorboard>=2.13.0

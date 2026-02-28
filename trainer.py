@@ -75,7 +75,7 @@ class Trainer:
         self.use_mixup = use_mixup
         self.mixup_alpha = mixup_alpha
         self.cutmix_alpha = cutmix_alpha
-        self.writer = writer or SummaryWriter(f'wd/runs/{exp_name}')  # для TensorBoard
+        self.writer = writer or SummaryWriter(f'./runs/{exp_name}')  # для TensorBoard
 
         # Нельзя одновременно использовать CutMix и MixUp
         if use_cutmix and use_mixup:

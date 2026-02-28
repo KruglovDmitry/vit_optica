@@ -1,5 +1,6 @@
 import torch
-from model import ViT, config
+from config import config
+from model import ViT
 from data import prepare_data
 from trainer import Trainer
 import torch.optim as optim
