@@ -1,11 +1,8 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-import numpy as np
-import matplotlib.pyplot as plt
-from IPython.display import display, clear_output
 import os
+import torch
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter  # опционально
 
 # Вспомогательные функции для CutMix и MixUp
@@ -63,7 +60,8 @@ def cutmix_data(x, y, alpha=1.0):
 class Trainer:
     def __init__(self, model, optimizer, loss_fn, exp_name, device,
                  scheduler=None, clip_grad_norm=1.0, use_cutmix=False, use_mixup=False,
-                 mixup_alpha=1.0, cutmix_alpha=1.0, writer=None):
+                 mixup_alpha=1.0, cutmix_alpha=1.0, writer=None,
+                 save_attention_every_n_epochs=10, num_attention_samples=8):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -76,14 +74,28 @@ class Trainer:
         self.mixup_alpha = mixup_alpha
         self.cutmix_alpha = cutmix_alpha
         self.writer = writer or SummaryWriter(f'./runs/{exp_name}')  # для TensorBoard
+        self.save_attention_every_n_epochs = save_attention_every_n_epochs
+        self.num_attention_samples = num_attention_samples
+        self.fixed_images = None   # будут инициализированы позже
+        self.fixed_labels = None
 
         # Нельзя одновременно использовать CutMix и MixUp
         if use_cutmix and use_mixup:
             raise ValueError("Choose either CutMix or MixUp, not both.")
 
+    def set_fixed_attention_samples(self, dataloader):
+        """Берём первые несколько изображений из даталоадера для визуализации внимания"""
+        data_iter = iter(dataloader)
+        images, labels = next(data_iter)
+        self.fixed_images = images[:self.num_attention_samples].to(self.device)
+        self.fixed_labels = labels[:self.num_attention_samples].to(self.device)
+        print(f"Fixed {self.num_attention_samples} images for attention visualization.")
+
     def train(self, trainloader, testloader, epochs, warmup_epochs=10,
               save_model_every_n_epochs=10, save_dir='checkpoints'):
+        
         os.makedirs(save_dir, exist_ok=True)
+        self.set_fixed_attention_samples(testloader)
 
         train_losses, test_losses, accuracies = [], [], []
         best_acc = 0.0
@@ -122,6 +134,9 @@ class Trainer:
                     best_acc = accuracy
                     self.save_checkpoint(os.path.join(save_dir, f'{self.exp_name}_best.pth'),
                                          epoch, accuracy, test_loss, is_best=True)
+                    
+            if epoch % self.save_attention_every_n_epochs == 0 or epoch == epochs:
+                self.save_attention_maps(epoch)
 
         # Save final model
         self.save_checkpoint(os.path.join(save_dir, f'{self.exp_name}_final.pth'),
@@ -204,3 +219,70 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f"Loaded checkpoint from {path}, epoch {checkpoint['epoch']}, acc {checkpoint['accuracy']:.4f}")
         return checkpoint['epoch']
+    
+    def save_attention_maps(self, epoch):
+        """Сохранить attention maps для фиксированных изображений"""
+        if self.fixed_images is None:
+            return
+
+        self.model.eval()
+        with torch.no_grad():
+            logits, attentions = self.model(self.fixed_images, output_attentions=True)
+            # attentions - список тензоров [num_layers, batch, heads, seq_len, seq_len]
+
+        # Создаём папку для сохранения
+        save_dir = Path(self.exp_name) / f"attention_epoch_{epoch:04d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Сохраняем сами карты внимания в тензорном формате
+        torch.save(attentions, save_dir / "attentions.pt")
+
+        # Также сохраняем изображения и предсказания для справки
+        torch.save(self.fixed_images.cpu(), save_dir / "images.pt")
+        torch.save(self.fixed_labels.cpu(), save_dir / "labels.pt")
+        torch.save(logits.cpu(), save_dir / "logits.pt")
+
+        print(f"Attention maps saved to {save_dir}")
+
+        # По желанию можно сразу сгенерировать несколько картинок
+        self.visualize_attention_maps(attentions, self.fixed_images.cpu(), epoch, save_dir)
+
+    def visualize_attention_maps(self, attentions, images, epoch, save_dir, num_heads_to_show=2):
+        """Создаёт и сохраняет PNG-визуализации для нескольких слоёв и голов"""
+        num_layers = len(attentions)
+        num_images = images.shape[0]
+        patch_size = self.model.config["patch_size"]  # предположим, config доступен
+
+        for img_idx in range(min(num_images, 4)):  # покажем не более 4 картинок
+            img = images[img_idx].permute(1,2,0).numpy()
+            # Нормализуем в [0,1] для отображения (зависит от preprocessing)
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+            for layer_idx in range(0, num_layers, max(1, num_layers//3)):  # каждый 3-й слой
+                attn_layer = attentions[layer_idx][img_idx]  # [heads, seq_len, seq_len]
+                num_heads = attn_layer.shape[0]
+
+                for head_idx in range(0, num_heads, max(1, num_heads//num_heads_to_show)):
+                    # Извлекаем внимание от CLS-токена к патчам (для классификации)
+                    attn_cls = attn_layer[head_idx, 0, 1:].cpu().numpy()  # [num_patches]
+                    # Преобразуем в пространственную карту
+                    num_patches_side = int(np.sqrt(attn_cls.shape[0]))
+                    attn_map = attn_cls.reshape(num_patches_side, num_patches_side)
+                    # Увеличиваем до размера изображения
+                    attn_map_resized = np.kron(attn_map, np.ones((patch_size, patch_size)))
+
+                    # Рисуем
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10,4))
+                    ax1.imshow(img)
+                    ax1.set_title(f"Image {img_idx}")
+                    ax1.axis('off')
+
+                    ax2.imshow(img, alpha=0.3)
+                    im = ax2.imshow(attn_map_resized, cmap='jet', alpha=0.7)
+                    ax2.set_title(f"Layer {layer_idx}, Head {head_idx}")
+                    ax2.axis('off')
+                    plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+
+                    save_path = save_dir / f"img{img_idx}_L{layer_idx}_H{head_idx}.png"
+                    plt.savefig(save_path, bbox_inches='tight', dpi=100)
+                    plt.close(fig)

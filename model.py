@@ -33,8 +33,7 @@ def optics_matmul(sim, tensor_1, tensor_2):
     max_B_neg = torch.max(B_neg)
 
     # Заранее создаём шаблон нулевого тензора
-    zero_template = torch.zeros_like(
-                        torch.empty(tensor_1.shape[0],tensor_1.shape[1], tensor_1.shape[2], tensor_2.shape[3]))
+    shape = (tensor_1.shape[0], tensor_1.shape[1], tensor_1.shape[2], tensor_2.shape[3])
     
     # Шаг 3: Вычисляем 4 компонента с защитой от деления на 0
     
@@ -42,25 +41,25 @@ def optics_matmul(sim, tensor_1, tensor_2):
     if max_A_pos > 0 and max_B_pos > 0:
         term1 = sim(A_pos / max_A_pos, B_pos / max_B_pos) * max_A_pos * max_B_pos
     else:
-        term1 = zero_template.clone().to(device)
+        term1 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
     
     # Компонент 2: A⁺ × B⁻ (со знаком минус в финальной формуле)
     if max_A_pos > 0 and max_B_neg > 0:
         term2 = sim(A_pos / max_A_pos, B_neg / max_B_neg) * max_A_pos * max_B_neg
     else:
-        term2 = zero_template.clone().to(device)
+        term2 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
     
     # Компонент 3: A⁻ × B⁺ (со знаком минус в финальной формуле)
     if max_A_neg > 0 and max_B_pos > 0:
         term3 = sim(A_neg / max_A_neg, B_pos / max_B_pos) * max_A_neg * max_B_pos
     else:
-        term3 = zero_template.clone().to(device)
+        term3 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
     
     # Компонент 4: A⁻ × B⁻
     if max_A_neg > 0 and max_B_neg > 0:
         term4 = sim(A_neg / max_A_neg, B_neg / max_B_neg) * max_A_neg * max_B_neg
     else:
-        term4 = zero_template.clone().to(device)
+        term4 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
     
     # Шаг 4: Собираем результат по формуле A⁺B⁺ - A⁺B⁻ - A⁻B⁺ + A⁻B⁻
     result = term1 - term2 - term3 + term4
@@ -331,8 +330,7 @@ class ViT(nn.Module):
 
         if self.use_optical:
             # Инициализируем симулятор только если нужна оптика
-            self.simulator = source.OpticalDataParallel(
-                source.OpticalMul(
+            self.simulator = source.OpticalMul(
                     source.Config(
                         right_matrix_count_columns=512,
                         right_matrix_count_rows=512,
@@ -345,7 +343,7 @@ class ViT(nn.Module):
                         left_matrix_split_y=2,
                         result_matrix_split=2,
                         distance=0.01,
-                ))).to(device)
+                )).to(device)
         else:
             self.simulator = None
 

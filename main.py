@@ -7,21 +7,21 @@ from trainer import Trainer
 import torch.optim as optim
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1,2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = f"0"
 
 # Конфигурация
 config.update(
     {
         "num_classes": 10,              # для CIFAR-10
-        "use_optical": True,            # использовать ли оптическое умножение
-        "optical_layers": 2,            # количество слоев с оптикой (0 = все, если use_optical=True)
+        "use_optical": False,           # использовать ли оптическое умножение
+        "optical_layers": 0,            # количество слоев с оптикой (0 = все, если use_optical=True)
         "stochastic_depth_rate": 0.1,
     }
 )
 
 # Данные
 trainloader, testloader, num_classes, _ = prepare_data(
-    batch_size=128,
+    batch_size=16,
     dataset_name='cifar10',
     use_autoaugment=True,
 )
@@ -45,13 +45,15 @@ trainer = Trainer(
     model=model,
     optimizer=optimizer,
     loss_fn=torch.nn.CrossEntropyLoss(),
-    exp_name='vit_cifar10_2_optics',
+    exp_name='vit_cifar10',
     device='cuda',
     scheduler=scheduler,
     clip_grad_norm=1.0,
     use_cutmix=True,      # или use_mixup=True
     mixup_alpha=1.0,
     cutmix_alpha=1.0,
+    save_attention_every_n_epochs=10,    # сохранять каждые 10 эпох
+    num_attention_samples=8              # использовать 8 изображений
 )
 
 # Запуск
