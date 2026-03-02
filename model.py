@@ -3,16 +3,15 @@ import torch.nn as nn
 import math
 import sys
 
-sys.path.insert(1, r'/wd/Optical_matrix_multiplication')
+sys.path.insert(1, r"/wd/Optical_matrix_multiplication")
 try:
     import source
 except ImportError:
     source = None
-    
+
 pixel_size = 3.6e-6
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-if torch.cuda.is_available():
-    torch.cuda.set_device(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def optics_matmul(sim, tensor_1, tensor_2):
     # Шаг 0: Дополняем размерность
@@ -198,7 +197,7 @@ class AttentionHead(nn.Module):
         return attention_output, attention_probs
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, config, simulator=None):
+    def __init__(self, config, simulator=None, layer_idx=0, total_layers=1):
         super().__init__()
         self.hidden_size = config["hidden_size"]
         self.num_attention_heads = config["num_attention_heads"]
@@ -206,17 +205,37 @@ class MultiHeadAttention(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         self.qkv_bias = config.get("qkv_bias", True)
         self.use_optical = config.get("use_optical", False)  # флаг из конфига
+        self.optical_layers = config.get("optical_layers", 0)
+        self.noise_std = config.get("noise_std", 0.0)
 
-        self.heads = nn.ModuleList([
-            AttentionHead(
-                self.hidden_size,
-                self.attention_head_size,
-                config["attention_probs_dropout_prob"],
-                bias=self.qkv_bias,
-                use_optical=self.use_optical,
-                simulator=simulator
-            ) for _ in range(self.num_attention_heads)
-        ])
+        # Определяем, использовать ли оптику в этом слое
+        if self.use_optical:
+            if self.optical_layers == 0:
+                # 0 означает использовать оптику во всех слоях
+                self.layer_use_optical = True
+            else:
+                # Распределяем optical_layers равномерно по всем слоям
+                # Например, если optical_layers=4 и total_layers=12, то используем оптику в слоях 0,3,6,9
+                step = max(1, total_layers // self.optical_layers)
+                self.layer_use_optical = (
+                    layer_idx % step == 0 and layer_idx < self.optical_layers * step
+                )
+        else:
+            self.layer_use_optical = False
+
+        self.heads = nn.ModuleList(
+            [
+                AttentionHead(
+                    self.hidden_size,
+                    self.attention_head_size,
+                    config["attention_probs_dropout_prob"],
+                    bias=self.qkv_bias,
+                    use_optical=self.layer_use_optical,
+                    simulator=simulator,
+                )
+                for _ in range(self.num_attention_heads)
+            ]
+        )
 
         self.output_projection = nn.Linear(self.all_head_size, self.hidden_size)
         self.output_dropout = nn.Dropout(config["hidden_dropout_prob"])
@@ -253,10 +272,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config, simulator=None, drop_path_rate=0.0):
+    def __init__(self, config, simulator=None, drop_path_rate=0.0, layer_idx=0, total_layers=1):
         super().__init__()
         self.hidden_size = config["hidden_size"]
-        self.attention = MultiHeadAttention(config, simulator)
+        self.attention = MultiHeadAttention(config, simulator, layer_idx, total_layers)
         self.layernorm_1 = nn.LayerNorm(self.hidden_size)
         self.mlp = MLP(config)
         self.layernorm_2 = nn.LayerNorm(self.hidden_size)
@@ -290,7 +309,7 @@ class Encoder(nn.Module):
         total_blocks = config["num_hidden_layers"]
         dpr = [x.item() for x in torch.linspace(0, config.get("stochastic_depth_rate", 0.0), total_blocks)]
         for i in range(total_blocks):
-            block = Block(config, simulator, drop_path_rate=dpr[i])
+            block = Block(config, simulator, drop_path_rate=dpr[i], layer_idx=i, total_layers=total_blocks,)
             self.blocks.append(block)
 
     def forward(self, x, output_attentions=False):
@@ -312,19 +331,21 @@ class ViT(nn.Module):
 
         if self.use_optical:
             # Инициализируем симулятор только если нужна оптика
-            self.simulator = source.OpticalMul(source.Config(
-                right_matrix_count_columns=512,
-                right_matrix_count_rows=512,
-                right_matrix_width=pixel_size * 512,
-                right_matrix_height=pixel_size * 512,
-                min_height_gap=pixel_size,
-                right_matrix_split_x=2,
-                right_matrix_split_y=2,
-                left_matrix_split_x=2,
-                left_matrix_split_y=2,
-                result_matrix_split=2,
-                distance=0.01
-            )).to(device)
+            self.simulator = source.OpticalDataParallel(
+                source.OpticalMul(
+                    source.Config(
+                        right_matrix_count_columns=512,
+                        right_matrix_count_rows=512,
+                        right_matrix_width=pixel_size * 512,
+                        right_matrix_height=pixel_size * 512,
+                        min_height_gap=pixel_size,
+                        right_matrix_split_x=2,
+                        right_matrix_split_y=2,
+                        left_matrix_split_x=2,
+                        left_matrix_split_y=2,
+                        result_matrix_split=2,
+                        distance=0.01,
+                ))).to(device)
         else:
             self.simulator = None
 
