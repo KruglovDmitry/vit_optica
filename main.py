@@ -7,7 +7,7 @@ from trainer import Trainer
 import torch.optim as optim
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ['CUDA_VISIBLE_DEVICES'] = f"0"
+os.environ['CUDA_VISIBLE_DEVICES'] = f"0,1"
 
 # Конфигурация
 config.update(
@@ -21,7 +21,7 @@ config.update(
 
 # Данные
 trainloader, testloader, num_classes, _ = prepare_data(
-    batch_size=16,
+    batch_size=32,
     dataset_name='cifar10',
     use_autoaugment=True,
 )
@@ -52,7 +52,7 @@ trainer = Trainer(
     use_cutmix=True,      # или use_mixup=True
     mixup_alpha=1.0,
     cutmix_alpha=1.0,
-    save_attention_every_n_epochs=10,    # сохранять каждые 10 эпох
+    save_attention_every_n_epochs=50,    # сохранять каждые 50 эпох
     num_attention_samples=8              # использовать 8 изображений
 )
 

@@ -231,7 +231,7 @@ class Trainer:
             # attentions - список тензоров [num_layers, batch, heads, seq_len, seq_len]
 
         # Создаём папку для сохранения
-        save_dir = Path(self.exp_name) / f"attention_epoch_{epoch:04d}"
+        save_dir = Path("attn_maps") / self.exp_name / f"attention_epoch_{epoch:04d}"
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # Сохраняем сами карты внимания в тензорном формате

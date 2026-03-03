@@ -330,7 +330,8 @@ class ViT(nn.Module):
 
         if self.use_optical:
             # Инициализируем симулятор только если нужна оптика
-            self.simulator = source.OpticalMul(
+            self.simulator = source.OpticalDataParallel(
+                source.OpticalMul(
                     source.Config(
                         right_matrix_count_columns=512,
                         right_matrix_count_rows=512,
@@ -343,7 +344,7 @@ class ViT(nn.Module):
                         left_matrix_split_y=2,
                         result_matrix_split=2,
                         distance=0.01,
-                )).to(device)
+                ))).to(device)
         else:
             self.simulator = None
 
