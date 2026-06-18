@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import sys
-
+from profiler import PROFILER
 sys.path.insert(1, r"/wd/Optical_matrix_multiplication")
 try:
     import source
@@ -13,57 +13,30 @@ pixel_size = 3.6e-6
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def optics_matmul(sim, tensor_1, tensor_2):
-    # Шаг 0: Дополняем размерность
-    tensor_1 = tensor_1[None,:,:,:]
-    tensor_2 = tensor_2[None,:,:,:]
+def optics_matmul(sim, tensor_1, tensor_2, eps=1e-8, equilibrate=False):
+    A = tensor_1[None, :, :, :]
+    B = tensor_2[None, :, :, :]
+    k = A.shape[-1]
 
-    # Шаг 1: Разделяем на положительные и отрицательные части
-    # A_pos содержит все положительные значения из A, остальные 0
-    # A_neg содержит модули всех отрицательных значений из A, остальные 0
-    A_pos = torch.clamp(tensor_1, min=0)      # A⁺ = max(A, 0)
-    A_neg = torch.clamp(-tensor_1, min=0)     # A⁻ = max(-A, 0)
-    B_pos = torch.clamp(tensor_2, min=0)      # B⁺ = max(B, 0)
-    B_neg = torch.clamp(-tensor_2, min=0)     # B⁻ = max(-B, 0)
-    
-    # Шаг 2: Находим максимальные значения для нормировки
-    max_A_pos = torch.max(A_pos)  # Может быть 0, если нет положительных значений
-    max_A_neg = torch.max(A_neg)  # Может быть 0, если нет отрицательных значений
-    max_B_pos = torch.max(B_pos)
-    max_B_neg = torch.max(B_neg)
+    if equilibrate:   # выравнивание вдоль контракции, инвариантно к результату
+        mA = A.detach().abs().amax(dim=-2, keepdim=True)             # [...,1,k]
+        mB = B.detach().abs().amax(dim=-1, keepdim=True)             # [...,k,1]
+        g  = torch.sqrt(mA / mB.transpose(-1, -2).clamp_min(eps)).clamp_min(eps)  # [...,1,k]
+        A = A / g
+        B = B * g.transpose(-1, -2)
 
-    # Заранее создаём шаблон нулевого тензора
-    shape = (tensor_1.shape[0], tensor_1.shape[1], tensor_1.shape[2], tensor_2.shape[3])
-    
-    # Шаг 3: Вычисляем 4 компонента с защитой от деления на 0
-    
-    # Компонент 1: A⁺ × B⁺
-    if max_A_pos > 0 and max_B_pos > 0:
-        term1 = sim(A_pos / max_A_pos, B_pos / max_B_pos) * max_A_pos * max_B_pos
-    else:
-        term1 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
-    
-    # Компонент 2: A⁺ × B⁻ (со знаком минус в финальной формуле)
-    if max_A_pos > 0 and max_B_neg > 0:
-        term2 = sim(A_pos / max_A_pos, B_neg / max_B_neg) * max_A_pos * max_B_neg
-    else:
-        term2 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
-    
-    # Компонент 3: A⁻ × B⁺ (со знаком минус в финальной формуле)
-    if max_A_neg > 0 and max_B_pos > 0:
-        term3 = sim(A_neg / max_A_neg, B_pos / max_B_pos) * max_A_neg * max_B_pos
-    else:
-        term3 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
-    
-    # Компонент 4: A⁻ × B⁻
-    if max_A_neg > 0 and max_B_neg > 0:
-        term4 = sim(A_neg / max_A_neg, B_neg / max_B_neg) * max_A_neg * max_B_neg
-    else:
-        term4 = torch.zeros(shape, device=tensor_1.device, dtype=tensor_1.dtype)
-    
-    # Шаг 4: Собираем результат по формуле A⁺B⁺ - A⁺B⁻ - A⁻B⁺ + A⁻B⁻
-    result = term1 - term2 - term3 + term4
-    return result[0,:,:,:]
+    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)   # [...,m,1]  сдвиг по строкам A
+    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)   # [...,1,n]  сдвиг по столбцам B
+
+    P, Q = A + sa, B + sb                                    # оба >= 0
+    a = P.amax(dim=-1, keepdim=True).clamp_min(eps)          # пер-строчная нормировка
+    b = Q.amax(dim=-2, keepdim=True).clamp_min(eps)          # пер-столбцовая нормировка
+    PQ = sim(P / a, Q / b) * a * b                           # один вызов, размеры как у matmul
+
+    corr_a = sb * A.sum(dim=-1, keepdim=True)
+    corr_b = sa * B.sum(dim=-2, keepdim=True)
+    corr_c = k * sa * sb
+    return (PQ - corr_a - corr_b - corr_c)[0, :, :, :]
 
 # Вспомогательная функция для DropPath (Stochastic Depth)
 def drop_path(x, drop_prob: float = 0., training: bool = False):
@@ -159,7 +132,7 @@ class Embeddings(nn.Module):
         return x
 
 class AttentionHead(nn.Module):
-    def __init__(self, hidden_size, attention_head_size, dropout, bias=True, use_optical=False, simulator=None):
+    def __init__(self, hidden_size, attention_head_size, dropout, bias=True, use_optical=False, simulator=None, layer_idx=0, head_idx=0):
         super().__init__()
         self.hidden_size = hidden_size
         self.attention_head_size = attention_head_size
@@ -171,15 +144,22 @@ class AttentionHead(nn.Module):
         self.value = nn.Linear(hidden_size, attention_head_size, bias=bias)
 
         self.dropout = nn.Dropout(dropout)
+        self.layer_idx = layer_idx
+        self.head_idx = head_idx
 
     def forward(self, x):
         query = self.query(x)
         key = self.key(x)
         value = self.value(x)
 
+        # профилирование (no-op, пока PROFILER.enabled == False)
+        PROFILER.observe(self.layer_idx, self.head_idx, "Q", query, contraction_dim=-1)
+        PROFILER.observe(self.layer_idx, self.head_idx, "K", key,   contraction_dim=-1)
+        PROFILER.observe(self.layer_idx, self.head_idx, "V", value, contraction_dim=-2)
+
         if self.use_optical and self.sim is not None:
             # Используем вашу оптическую функцию
-            attention_scores = optics_matmul(self.sim, query, key.transpose(-1, -2))
+            attention_scores = optics_matmul(self.sim, query, key.transpose(-1, -2), equilibrate=True)
         else:
             # Обычное матричное умножение (torch)
             attention_scores = torch.matmul(query, key.transpose(-1, -2))
@@ -187,6 +167,8 @@ class AttentionHead(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
         attention_probs = self.dropout(attention_probs)
+
+        PROFILER.observe(self.layer_idx, self.head_idx, "attn", attention_probs, contraction_dim=-1)
 
         if self.use_optical and self.sim is not None:
             attention_output = optics_matmul(self.sim, attention_probs, value)
@@ -231,8 +213,9 @@ class MultiHeadAttention(nn.Module):
                     bias=self.qkv_bias,
                     use_optical=self.layer_use_optical,
                     simulator=simulator,
+                    layer_idx=layer_idx, head_idx=h,
                 )
-                for _ in range(self.num_attention_heads)
+                for h in range(self.num_attention_heads)
             ]
         )
 
