@@ -9,30 +9,21 @@ try:
 except ImportError:
     source = None
 
+SIM_GAIN_INV = 1.0 / 3.44e-3
 pixel_size = 3.6e-6
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def optics_matmul(sim, tensor_1, tensor_2, eps=1e-8, equilibrate=False):
+def optics_matmul(sim, tensor_1, tensor_2, eps=1e-8, gain=1.0):
     A = tensor_1[None, :, :, :]
     B = tensor_2[None, :, :, :]
     k = A.shape[-1]
-
-    if equilibrate:   # выравнивание вдоль контракции, инвариантно к результату
-        mA = A.detach().abs().amax(dim=-2, keepdim=True)             # [...,1,k]
-        mB = B.detach().abs().amax(dim=-1, keepdim=True)             # [...,k,1]
-        g  = torch.sqrt(mA / mB.transpose(-1, -2).clamp_min(eps)).clamp_min(eps)  # [...,1,k]
-        A = A / g
-        B = B * g.transpose(-1, -2)
-
-    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)   # [...,m,1]  сдвиг по строкам A
-    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)   # [...,1,n]  сдвиг по столбцам B
-
-    P, Q = A + sa, B + sb                                    # оба >= 0
-    a = P.amax(dim=-1, keepdim=True).clamp_min(eps)          # пер-строчная нормировка
-    b = Q.amax(dim=-2, keepdim=True).clamp_min(eps)          # пер-столбцовая нормировка
-    PQ = sim(P / a, Q / b) * a * b                           # один вызов, размеры как у matmul
-
+    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)
+    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)
+    P, Q = A + sa, B + sb
+    a = P.amax(dim=-1, keepdim=True).clamp_min(eps)
+    b = Q.amax(dim=-2, keepdim=True).clamp_min(eps)
+    PQ = sim(P / a, Q / b) * a * b * gain
     corr_a = sb * A.sum(dim=-1, keepdim=True)
     corr_b = sa * B.sum(dim=-2, keepdim=True)
     corr_c = k * sa * sb
@@ -159,7 +150,7 @@ class AttentionHead(nn.Module):
 
         if self.use_optical and self.sim is not None:
             # Используем вашу оптическую функцию
-            attention_scores = optics_matmul(self.sim, query, key.transpose(-1, -2), equilibrate=True)
+            attention_scores = optics_matmul(self.sim, query, key.transpose(-1, -2), gain=SIM_GAIN_INV)
         else:
             # Обычное матричное умножение (torch)
             attention_scores = torch.matmul(query, key.transpose(-1, -2))
@@ -171,7 +162,7 @@ class AttentionHead(nn.Module):
         PROFILER.observe(self.layer_idx, self.head_idx, "attn", attention_probs, contraction_dim=-1)
 
         if self.use_optical and self.sim is not None:
-            attention_output = optics_matmul(self.sim, attention_probs, value)
+            attention_output = optics_matmul(self.sim, attention_probs, value, gain=SIM_GAIN_INV)
         else:
             attention_output = torch.matmul(attention_probs, value)
 
