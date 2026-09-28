@@ -1,5 +1,5 @@
-/__pycache__
-/checkpoints
-/attn_maps
-/data
-/runs
+__pycache__/
+*.pyc
+runs_vit/
+data/
+*.pt
