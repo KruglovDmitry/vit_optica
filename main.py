@@ -44,6 +44,8 @@ def get_args():
     a('--drop_path', type=float, default=0.1)
     a('--ls_init', type=float, default=1e-4)
     a('--token_order', default='raster', choices=['raster', 'random'])
+    a('--stem', default='patch', choices=['patch', 'conv'],
+      help='patch — нарезка на патчи; conv — свёрточный стебель (цифровой, те же токены)')
     # оптика
     a('--mode', default='digital', choices=['digital', 'shift', 'split'])
     a('--optic_where', default='all', help="ff, proj, qk, av через '+'; all / attn / none")
@@ -73,6 +75,8 @@ def get_args():
     a('--wd', type=float, default=0.05)
     a('--label_smoothing', type=float, default=0.1)
     a('--cutmix_prob', type=float, default=0.5)
+    a('--mixup_alpha', type=float, default=0.0,
+      help='>0: MixUp на батчах, где не применён CutMix')
     a('--eval_every', type=int, default=5)
     a('--max_eval_batches', type=int, default=0, help='0 = вся выборка')
     a('--eval_only', type=int, default=0)
@@ -87,6 +91,12 @@ def get_args():
     a('--tensorboard', type=int, default=1, help='писать кривые в <out_dir>/tb/<имя запуска>')
     a('--comment', default='')
     return p.parse_args()
+
+
+def mixup(x, y, alpha):
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
 
 
 def cutmix(x, y, alpha=1.0):
@@ -155,6 +165,11 @@ def main():
     args = get_args()
     torch.manual_seed(args.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        print(f'Устройство: cuda:{torch.cuda.current_device()} '
+              f'({torch.cuda.get_device_name()}), видно карт: {torch.cuda.device_count()}')
+    else:
+        print('ВНИМАНИЕ: CUDA недоступна, обучение идёт на CPU')
     dcfg = DATASET_DEFAULTS[args.dataset]
     patch = args.patch or dcfg['patch']
 
@@ -199,18 +214,21 @@ def main():
     ctx.per_shape_gain = sim is not None and args.calibrate == 2
 
     # ---------------------------------------------------------------- модель
-    model = ViT(ctx, img_size, patch, 3, n_cls, args.h_dim, args.depth, args.heads,
-                args.mlp_ratio, args.drop, args.drop_path, args.ls_init,
-                args.token_order).to(device)
+    ck = None
     if args.load_ckpt:
         ck = torch.load(args.load_ckpt, map_location=device)
+        ck_cfg = ck.get('config', {})
+        for key, default in (('token_order', 'raster'), ('stem', 'patch')):
+            val = ck_cfg.get(key, default)
+            if val != getattr(args, key):
+                print(f'ВНИМАНИЕ: --{key} берётся из чекпоинта ({val}), а не {getattr(args, key)}')
+                setattr(args, key, val)
+    model = ViT(ctx, img_size, patch, 3, n_cls, args.h_dim, args.depth, args.heads,
+                args.mlp_ratio, args.drop, args.drop_path, args.ls_init,
+                args.token_order, stem=args.stem).to(device)
+    if ck is not None:
         model.load_state_dict(ck['state_dict'], strict=True)
         print(f'загружены веса {args.load_ckpt} (режим обучения: {ck.get("mode")})')
-        ck_order = ck.get('config', {}).get('token_order', 'raster')
-        if ck_order != args.token_order:
-            print(f'ВНИМАНИЕ: порядок токенов берётся из чекпоинта ({ck_order}), '
-                  f'а не из --token_order {args.token_order}')
-            args.token_order = ck_order
     flags, blocks = apply_optic_where(model, args.optic_where if args.mode != 'digital'
                                       else 'none', args.optic_layers)
     n_params = sum(p.numel() for p in model.parameters())
@@ -251,8 +269,9 @@ def main():
         opt.zero_grad(set_to_none=True)
         for i, (x, y) in enumerate(tl):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            if args.cutmix_prob > 0 and torch.rand(1).item() < args.cutmix_prob:
-                x, ya, yb, lam = cutmix(x, y)
+            use_cm = args.cutmix_prob > 0 and torch.rand(1).item() < args.cutmix_prob
+            if use_cm or args.mixup_alpha > 0:
+                x, ya, yb, lam = cutmix(x, y) if use_cm else mixup(x, y, args.mixup_alpha)
                 logits = model(x)                           # один прямой проход
                 loss = (lam * F.cross_entropy(logits, ya, label_smoothing=args.label_smoothing)
                         + (1 - lam) * F.cross_entropy(logits, yb, label_smoothing=args.label_smoothing))

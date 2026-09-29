@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-COLS = ['name', 'mode', 'where', 'blocks', 'lens', 'split_norm', 'order', 'phase',
+COLS = ['name', 'mode', 'where', 'blocks', 'lens', 'split_norm', 'order', 'stem', 'phase',
         'epochs', 'val_acc', 'test_acc', 'test_top5', 'test_acc_best_val',
         'err_ff1', 'err_ff2', 'err_proj', 'err_qk', 'err_av',
         'leak_qk_cols', 'leak_av_zero', 'leak_batch_model', 'wall_min']
@@ -25,7 +25,7 @@ def row(p):
     return dict(
         name=p.stem, mode=d['mode'], where=d['optic_where'] if d['mode'] != 'digital' else 'none',
         blocks=len(d.get('optic_blocks', [])), lens=d['lens_size'], split_norm=d['split_norm'],
-        order=d['token_order'], phase=phase, epochs=0 if d['inference'] else a['epochs'],
+        order=d['token_order'], stem=a.get('stem', 'patch'), phase=phase, epochs=0 if d['inference'] else a['epochs'],
         val_acc=f(d['val']['acc']), test_acc=f(d['test']['acc']), test_top5=f(d['test']['top5']),
         test_acc_best_val=f(tb.get('acc')),
         **{f'err_{k}': f(le.get(k, {}).get('rel')) for k in ('ff1', 'ff2', 'proj', 'qk', 'av')},
