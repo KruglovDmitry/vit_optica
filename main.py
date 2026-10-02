@@ -46,6 +46,8 @@ def get_args():
     a('--token_order', default='raster', choices=['raster', 'random'])
     a('--stem', default='patch', choices=['patch', 'conv'],
       help='patch — нарезка на патчи; conv — свёрточный стебель (цифровой, те же токены)')
+    a('--stem_width', type=float, default=1.0,
+      help='множитель каналов стебля: 1.0 -> 48/96, 0.5 -> 24/48 (при h_dim 192, патч 28)')
     # оптика
     a('--mode', default='digital', choices=['digital', 'shift', 'split'])
     a('--optic_where', default='all', help="ff, proj, qk, av через '+'; all / attn / none")
@@ -84,6 +86,10 @@ def get_args():
       help='замер скорости: N итераций обучения, прогноз времени на --epochs, выход')
     a('--load_ckpt', default='')
     a('--save_ckpt', type=int, default=1)
+    a('--ckpt_every', type=int, default=5,
+      help='каждые N эпох сохранять состояние обучения для продолжения (0 = не сохранять)')
+    a('--resume', type=int, default=1,
+      help='1: если есть last_<имя>.pt в out_dir, продолжить обучение с него')
     a('--seed', type=int, default=1337)
     # диагностика
     a('--leak_tests', type=int, default=1)
@@ -115,13 +121,20 @@ def cutmix(x, y, alpha=1.0):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, max_batches=0):
+def evaluate(model, loader, device, max_batches=0, progress=''):
+    """progress — подпись для печати хода оценки (для долгих оптических прогонов)."""
     model.eval()
     n = correct = correct5 = 0
     loss = 0.0
+    total = min(len(loader), max_batches) if max_batches else len(loader)
+    t0 = time.time()
     for i, (x, y) in enumerate(loader):
         if max_batches and i >= max_batches:
             break
+        if progress and i and (i % 10 == 0):
+            el = time.time() - t0
+            print(f'  {progress}: {i}/{total} батчей, {el / 60:.1f} мин, '
+                  f'осталось ≈ {el / i * (total - i) / 60:.1f} мин', flush=True)
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         logits = model(x)
         loss += F.cross_entropy(logits, y, reduction='sum').item()
@@ -218,14 +231,14 @@ def main():
     if args.load_ckpt:
         ck = torch.load(args.load_ckpt, map_location=device)
         ck_cfg = ck.get('config', {})
-        for key, default in (('token_order', 'raster'), ('stem', 'patch')):
+        for key, default in (('token_order', 'raster'), ('stem', 'patch'), ('stem_width', 1.0)):
             val = ck_cfg.get(key, default)
             if val != getattr(args, key):
                 print(f'ВНИМАНИЕ: --{key} берётся из чекпоинта ({val}), а не {getattr(args, key)}')
                 setattr(args, key, val)
     model = ViT(ctx, img_size, patch, 3, n_cls, args.h_dim, args.depth, args.heads,
                 args.mlp_ratio, args.drop, args.drop_path, args.ls_init,
-                args.token_order, stem=args.stem).to(device)
+                args.token_order, stem=args.stem, stem_width=args.stem_width).to(device)
     if ck is not None:
         model.load_state_dict(ck['state_dict'], strict=True)
         print(f'загружены веса {args.load_ckpt} (режим обучения: {ck.get("mode")})')
@@ -261,9 +274,19 @@ def main():
             print('tensorboard не установлен (pip install tensorboard) — кривые не пишутся')
 
     log, best = [], dict(acc=-1.0, epoch=-1, state=None)
-    t0, step = time.time(), 0
+    t0, step, start_ep, wall_before = time.time(), 0, 0, 0.0
+    last_path = Path(args.out_dir) / f'last_{run_name}.pt'
+    if epochs and args.resume and last_path.exists():
+        st = torch.load(last_path, map_location=device, weights_only=False)
+        model.load_state_dict(st['model']); opt.load_state_dict(st['opt'])
+        step, start_ep, log, best = st['step'], st['epoch'], st['log'], st['best']
+        wall_before = st['wall']
+        torch.set_rng_state(st['rng_cpu'])
+        if torch.cuda.is_available() and st.get('rng_cuda') is not None:
+            torch.cuda.set_rng_state(st['rng_cuda'])
+        print(f'ПРОДОЛЖЕНИЕ с эпохи {start_ep + 1} из {last_path}')
     model.train()
-    for ep in range(epochs):
+    for ep in range(start_ep, epochs):
         te0 = time.time()
         tot_loss, nb = 0.0, 0
         opt.zero_grad(set_to_none=True)
@@ -302,11 +325,24 @@ def main():
                 tb.add_scalar('Loss/val', rec['val_loss'], ep + 1)
         print(f"эпоха {ep + 1:4d} | loss {rec['train_loss']:.3f} | lr {rec['lr']:.2e} | "
               f"val {rec.get('val_acc', float('nan')):5.2f}% | {rec['epoch_sec']:.0f} с")
-    wall = time.time() - t0
+        if args.ckpt_every and ((ep + 1) % args.ckpt_every == 0) and ep + 1 < epochs:
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+            tmp = last_path.with_suffix('.tmp')
+            torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step,
+                            epoch=ep + 1, log=log, best=best,
+                            wall=wall_before + time.time() - t0,
+                            rng_cpu=torch.get_rng_state(),
+                            rng_cuda=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                            config=vars(args)), tmp)
+            tmp.replace(last_path)                      # атомарно: не испортить при обрыве
+    wall = wall_before + time.time() - t0
+    if epochs and last_path.exists():
+        last_path.unlink()                              # обучение завершено — продолжать нечего
 
     # ---------------------------------------------------------------- итоговая оценка
-    res_val = evaluate(model, vl, device, args.max_eval_batches)
-    res_test = evaluate(model, te, device, args.max_eval_batches)
+    pr = lambda name: name if args.mode != 'digital' else ''
+    res_val = evaluate(model, vl, device, args.max_eval_batches, pr('val'))
+    res_test = evaluate(model, te, device, args.max_eval_batches, pr('test'))
     res_test_best = None
     if best['state'] is not None and best['epoch'] != epochs:
         last = copy.deepcopy(model.state_dict())

@@ -224,12 +224,13 @@ class ConvStem(nn.Module):
     (img_size / patch)^2 токенов, что и обычная нарезка. Число токенов и стоимость
     оптики не меняются; добавляется локальность, которой ViT не хватает на малых данных.
     """
-    def __init__(self, in_ch, dim, patch, max_stages=4):
+    def __init__(self, in_ch, dim, patch, max_stages=4, width=1.0):
         super().__init__()
         n = 0
         while n < max_stages and patch % (2 ** (n + 1)) == 0 and 2 ** (n + 1) <= patch:
             n += 1
-        chans = [max(dim // 2 ** (n - i), 16) for i in range(n)]   # напр. 48, 96 при dim=192
+        # напр. 48, 96 при dim=192; width < 1 сужает стебель (меньше цифровых вычислений)
+        chans = [max(int(dim // 2 ** (n - i) * width), 16) for i in range(n)]
         layers, c = [], in_ch
         for co in chans:
             layers += [nn.Conv2d(c, co, 3, 2, 1, bias=False), nn.BatchNorm2d(co), nn.ReLU(inplace=True)]
@@ -250,14 +251,14 @@ class ViT(nn.Module):
     def __init__(self, ctx, img_size=64, patch=8, in_ch=3, num_classes=200,
                  dim=192, depth=12, heads=6, mlp_ratio=2, drop=0.1,
                  drop_path=0.1, ls_init=1e-4, token_order='raster', order_seed=0,
-                 stem='patch'):
+                 stem='patch', stem_width=1.0):
         super().__init__()
         assert img_size % patch == 0 and dim % heads == 0
         self.ctx = ctx
         self.n_patches = (img_size // patch) ** 2
         assert stem in ('patch', 'conv')
         self.patch = (nn.Conv2d(in_ch, dim, patch, patch) if stem == 'patch'
-                      else ConvStem(in_ch, dim, patch))
+                      else ConvStem(in_ch, dim, patch, width=stem_width))
         self.cls = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos = nn.Parameter(torch.zeros(1, self.n_patches + 1, dim))
         if token_order == 'random':

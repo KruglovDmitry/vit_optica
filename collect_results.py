@@ -25,7 +25,7 @@ def row(p):
     return dict(
         name=p.stem, mode=d['mode'], where=d['optic_where'] if d['mode'] != 'digital' else 'none',
         blocks=len(d.get('optic_blocks', [])), lens=d['lens_size'], split_norm=d['split_norm'],
-        order=d['token_order'], stem=a.get('stem', 'patch'), phase=phase, epochs=0 if d['inference'] else a['epochs'],
+        order=d['token_order'], stem=a.get('stem', 'patch') + (f"x{a['stem_width']}" if a.get('stem') == 'conv' and a.get('stem_width', 1.0) != 1.0 else ''), phase=phase, epochs=0 if d['inference'] else a['epochs'],
         val_acc=f(d['val']['acc']), test_acc=f(d['test']['acc']), test_top5=f(d['test']['top5']),
         test_acc_best_val=f(tb.get('acc')),
         **{f'err_{k}': f(le.get(k, {}).get('rel')) for k in ('ff1', 'ff2', 'proj', 'qk', 'av')},
