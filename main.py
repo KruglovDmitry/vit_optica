@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from vit_optica.model import FastSim, check_fast_sim
 from vit_optica import (build_sim, OpticContext, ViT, apply_optic_where,
                         ParallelSim, check_parallel, build_datasets, build_loaders,
                         DATASET_DEFAULTS, operator_leak_tests, batch_independence_test)
@@ -63,6 +64,9 @@ def get_args():
     a('--stub_sim', action='store_true')
     a('--stub_blur', type=float, default=0.0)
     a('--noise_sigma', type=float, default=0.0)
+    a('--fast_sim', type=int, default=1,
+      help='1: тот же расчёт симулятора с переставленным порядком умножений (быстрее и '
+           'экономнее по памяти); при старте сверяется с исходным, при расхождении — откат')
     a('--sim_parallel', type=int, default=0)
     a('--sim_devices', default='')
     a('--check_parallel', type=int, default=1)
@@ -207,7 +211,12 @@ def main():
     sim = None
     if args.mode != 'digital':
         sim = build_sim(args.stub_sim, device, args.aperture, args.lens_size,
-                        args.distance, args.noise_sigma, args.stub_blur)
+                        args.distance, args.noise_sigma, args.stub_blur,
+                        fast=bool(args.fast_sim) and not args.stub_sim)
+        if isinstance(sim, FastSim) and not check_fast_sim(
+                sim, device, shapes=((T, hd, T), (T, args.h_dim, args.h_dim * args.mlp_ratio))):
+            print('ВНИМАНИЕ: FastSim расходится с исходным расчётом — используется исходный')
+            sim = sim.sim
         if args.sim_parallel and torch.cuda.device_count() > 1:
             devs = ([int(d) for d in args.sim_devices.split(',') if d.strip()]
                     or list(range(torch.cuda.device_count())))

@@ -51,8 +51,60 @@ class StubSim(nn.Module):
         return y
 
 
+class FastSim(nn.Module):
+    """Тот же расчёт, что OpticalMul.forward, но с другим порядком матричных умножений.
+
+    В OpticalMul поле каждой строки левой матрицы строится на сетке 2N x 2K и
+    распространяется плотными операторами: (Y1 @ f) @ X1, затем Y2 @ (поле * маска) @ X2.
+    Стоимость ~ M*N*K*(N+K), память ~ M*N*K комплексных чисел на вызов.
+
+    Но входное поле строки — ранг 1 (одинаковые строки после kron с единицами), поэтому
+        Y1 @ f @ X1 = y ⊗ g,  y = Y1 @ 1,  g = f_row @ X1,
+        Y2 @ ((y ⊗ g) * маска) @ X2 = Y2 @ (y * (маска @ (g * x2))).
+    Это то же выражение (ассоциативность), только без построения поля 2N x 2K для
+    каждой строки: стоимость ~ M*(K^2 + N*K + N^2), как у обычного умножения.
+    Совпадение с OpticalMul проверяется при старте (check_fast_sim).
+    """
+    def __init__(self, sim):
+        super().__init__()
+        self.sim = sim
+
+    @staticmethod
+    def _slices(prop, field_shape, res_shape):
+        Y, X = prop.operator_Y, prop.operator_X
+        sc = lambda tot, n: slice((tot - n) // 2, (tot - n) // 2 + n)
+        return (Y[..., sc(Y.shape[-2], res_shape[0]), sc(Y.shape[-1], field_shape[0])],
+                X[..., sc(X.shape[-2], field_shape[1]), sc(X.shape[-1], res_shape[1])])
+
+    def forward(self, A, B):
+        sim = self.sim
+        vec = sim.prepare_vector(A)                      # (..., M, sy, sx*K), строки одинаковы
+        mat = sim.prepare_matrix(B)                      # (..., 1, 2N, 2K)
+        Y1, X1 = self._slices(sim._propagator_one, vec.shape[-2:], mat.shape[-2:])
+        Y2, X2 = self._slices(sim._propagator_two, mat.shape[-2:], (mat.size(-2), 1))
+        y = (Y1 @ vec.new_ones(vec.shape[-2], 1)).squeeze(-1)    # (2N,)
+        g = vec[..., :1, :] @ X1                                  # (..., M, 1, 2K)
+        u = g.squeeze(-2) * X2.squeeze(-1)                        # (..., M, 2K)
+        h = (u @ mat.squeeze(-3).transpose(-1, -2)) * y           # (..., M, 2N)
+        out = h @ Y2.transpose(-1, -2)                            # (..., M, 2N)
+        return sim.prepare_out(out.unsqueeze(-1))
+
+
+@torch.no_grad()
+def check_fast_sim(fast, device, shapes=((65, 32, 65), (65, 192, 384)), tol=1e-4):
+    """Сравнение FastSim с исходным OpticalMul на случайных матрицах."""
+    worst = 0.0
+    for m, k, n in shapes:
+        A = torch.rand(2, 1, m, k, device=device)
+        B = torch.rand(1, 1, k, n, device=device)
+        ref, out = fast.sim(A, B), fast(A, B)
+        worst = max(worst, ((out - ref).norm() / ref.norm()).item())
+    print(f'FastSim: отличие от исходного расчёта {worst:.1e} (допуск {tol:.0e})')
+    return worst < tol
+
+
 def build_sim(stub, device, aperture=512, lens_size=16384, distance=0.15,
-              noise_sigma=0.0, stub_blur=0.0):
+              noise_sigma=0.0, stub_blur=0.0, fast=False):
     if stub:
         return StubSim(noise_sigma, stub_blur).to(device)
     import source
@@ -63,7 +115,8 @@ def build_sim(stub, device, aperture=512, lens_size=16384, distance=0.15,
         right_matrix_split_x=2, right_matrix_split_y=2,
         left_matrix_split_x=2, left_matrix_split_y=2, result_matrix_split=2,
         distance=distance, lens_size=lens_size)
-    return source.OpticalMul(cfg).to(device)
+    sim = source.OpticalMul(cfg).to(device)
+    return FastSim(sim) if fast else sim
 
 
 # ================================================= способы знакового умножения
