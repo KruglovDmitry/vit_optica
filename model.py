@@ -154,7 +154,7 @@ def inc_split(pitch, na, lam=532e-9):
 
 def build_inc_sim(device, field, lens_size, distance, pitch=3.6e-6, split=0,
                   lens_pix=1.8e-6, src_fill=1.0, mask_fill=1.0, det_fill=1.0,
-                  src_samples_y=2):
+                  src_samples_y=0):
     import source
     na = lens_size * lens_pix / 2 / distance
     split = split or inc_split(pitch, na)
@@ -163,10 +163,12 @@ def build_inc_sim(device, field, lens_size, distance, pitch=3.6e-6, split=0,
         src_fill=src_fill, src_height=pitch, src_samples_y=src_samples_y,
         mask_fill=mask_fill, det_fill=det_fill, distance=distance,
         lens_pixel_size=lens_pix, lens_size=lens_size)
+    if not src_samples_y:          # 0 = столько точек по высоте светодиода, чтобы растяжка покрыла поле
+        cfg.src_samples_y = source.IncoherentOpticalMul.min_src_samples(cfg)
     mul = source.IncoherentOpticalMul(cfg, device=device)
     g = mul.check_grid()
     print(f'Некогерентная схема: поле {field}, элемент {pitch*1e6:.1f} мкм, split {split}, '
-          f'NA {g["na"]:.3f}, u = {g["u_x"]:.2f}, сетка {"OK" if g["ok"] else "НАРУШЕНА"}')
+          f'NA {g["na"]:.3f}, u = {g["u_x"]:.2f}, точек светодиода {cfg.src_samples_y}, сетка {"OK" if g["ok"] else "НАРУШЕНА"}')
     return IncoherentSim(mul).to(device)
 
 
