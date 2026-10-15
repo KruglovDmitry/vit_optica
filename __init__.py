@@ -1,4 +1,4 @@
-from .model import (build_sim, OpticContext, ViT, MODES,
+from .model import (build_sim, build_inc_sim, OpticContext, ViT, MODES,
                     resolve_optic_where, apply_optic_where)
 from .parallel import ParallelSim, check_parallel
 from .data import build_datasets, build_loaders, DATASET_DEFAULTS

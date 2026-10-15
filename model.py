@@ -119,6 +119,57 @@ def build_sim(stub, device, aperture=512, lens_size=16384, distance=0.15,
     return FastSim(sim) if fast else sim
 
 
+class IncoherentSim(nn.Module):
+    """Некогерентная схема в интенсивностях (source/incoherent.py в Optical_matrix_multiplication).
+
+    Вход — мощности светодиодов, правый операнд — пропускание маски, выход — мощность на
+    детекторах, корня нет. Отклик маски R зависит только от правого операнда, поэтому для
+    статических весов (без градиента, без батча) он кэшируется по содержимому матрицы.
+    """
+    def __init__(self, mul, cache=True):
+        super().__init__()
+        self.mul, self.cache = mul, cache
+        self._resp = {}
+
+    @staticmethod
+    def _key(Q):
+        q = Q.detach().double().flatten()
+        return (tuple(Q.shape), q.sum().item(), (q * q).sum().item(), q[::97].sum().item())
+
+    def forward(self, P, Q):
+        static = self.cache and not Q.requires_grad and all(d == 1 for d in Q.shape[:-2])
+        if not static:
+            return self.mul(P, Q)
+        key = self._key(Q)
+        if key not in self._resp:
+            with torch.no_grad():
+                self._resp[key] = self.mul.response(Q)
+        return self.mul(P, Q, response=self._resp[key])
+
+
+def inc_split(pitch, na, lam=532e-9):
+    """Подотсчёты на элемент по правилу сетки δ ≤ λ/(8·NA)."""
+    return max(2, math.ceil(pitch / (lam / (8 * na))))
+
+
+def build_inc_sim(device, field, lens_size, distance, pitch=3.6e-6, split=0,
+                  lens_pix=1.8e-6, src_fill=1.0, mask_fill=1.0, det_fill=1.0,
+                  src_samples_y=2):
+    import source
+    na = lens_size * lens_pix / 2 / distance
+    split = split or inc_split(pitch, na)
+    cfg = source.IncoherentConfig(
+        n_in=field, n_out=field, pitch_x=pitch, split_x=split, split_y=split,
+        src_fill=src_fill, src_height=pitch, src_samples_y=src_samples_y,
+        mask_fill=mask_fill, det_fill=det_fill, distance=distance,
+        lens_pixel_size=lens_pix, lens_size=lens_size)
+    mul = source.IncoherentOpticalMul(cfg, device=device)
+    g = mul.check_grid()
+    print(f'Некогерентная схема: поле {field}, элемент {pitch*1e6:.1f} мкм, split {split}, '
+          f'NA {g["na"]:.3f}, u = {g["u_x"]:.2f}, сетка {"OK" if g["ok"] else "НАРУШЕНА"}')
+    return IncoherentSim(mul).to(device)
+
+
 # ================================================= способы знакового умножения
 def mm_shift(ctx, A, B, eps=1e-8):
     k = A.shape[-1]

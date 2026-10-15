@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from vit_optica.model import FastSim, check_fast_sim
-from vit_optica import (build_sim, OpticContext, ViT, apply_optic_where,
+from vit_optica import (build_sim, build_inc_sim, OpticContext, ViT, apply_optic_where,
                         ParallelSim, check_parallel, build_datasets, build_loaders,
                         DATASET_DEFAULTS, operator_leak_tests, batch_independence_test)
 
@@ -67,6 +67,15 @@ def get_args():
     a('--fast_sim', type=int, default=1,
       help='1: тот же расчёт симулятора с переставленным порядком умножений (быстрее и '
            'экономнее по памяти); при старте сверяется с исходным, при расхождении — откат')
+    a('--physics', default='coherent', choices=['coherent', 'incoherent'],
+      help='incoherent — схема светодиоды/маска/фотодетекторы в интенсивностях')
+    a('--inc_pitch', type=float, default=3.6e-6, help='шаг элемента некогерентной схемы, м')
+    a('--inc_split', type=int, default=0, help='подотсчётов на элемент (0 = по правилу λ/(8NA))')
+    a('--inc_lens_pix', type=float, default=1.8e-6, help='шаг сетки линзы, м')
+    a('--inc_src_fill', type=float, default=1.0, help='доля шага, которая светится у светодиода')
+    a('--inc_mask_fill', type=float, default=1.0, help='открытая доля ячейки маски')
+    a('--inc_det_fill', type=float, default=1.0, help='доля шага под фотодетектором')
+    a('--inc_field', type=int, default=0, help='поле установки (0 = самая широкая матрица модели)')
     a('--sim_parallel', type=int, default=0)
     a('--sim_devices', default='')
     a('--check_parallel', type=int, default=1)
@@ -210,9 +219,16 @@ def main():
             f'число токенов или увеличь --aperture')
     sim = None
     if args.mode != 'digital':
-        sim = build_sim(args.stub_sim, device, args.aperture, args.lens_size,
-                        args.distance, args.noise_sigma, args.stub_blur,
-                        fast=bool(args.fast_sim) and not args.stub_sim)
+        if args.physics == 'incoherent' and not args.stub_sim:
+            field = args.inc_field or widest
+            sim = build_inc_sim(device, field, args.lens_size, args.distance,
+                                args.inc_pitch, args.inc_split, args.inc_lens_pix,
+                                args.inc_src_fill, args.inc_mask_fill, args.inc_det_fill)
+        else:
+            field = args.aperture
+            sim = build_sim(args.stub_sim, device, args.aperture, args.lens_size,
+                            args.distance, args.noise_sigma, args.stub_blur,
+                            fast=bool(args.fast_sim) and not args.stub_sim)
         if isinstance(sim, FastSim) and not check_fast_sim(
                 sim, device, shapes=((T, hd, T), (T, args.h_dim, args.h_dim * args.mlp_ratio))):
             print('ВНИМАНИЕ: FastSim расходится с исходным расчётом — используется исходный')
@@ -227,8 +243,8 @@ def main():
     gain = args.gain
     if sim is not None and args.calibrate:
         with torch.no_grad():
-            P = torch.rand(1, 1, args.aperture, args.aperture, device=device)
-            Q = torch.rand(1, 1, args.aperture, args.aperture, device=device)
+            P = torch.rand(1, 1, field, field, device=device)
+            Q = torch.rand(1, 1, field, field, device=device)
             raw, ref = sim(P, Q), P @ Q
             gain = ((raw * ref).sum() / (raw * raw).sum()).item()
         print(f'Калибровка gain: {gain:.4f}')
