@@ -12,6 +12,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 
 _OPTICS_DIR = os.path.abspath(
@@ -139,6 +140,10 @@ class IncoherentSim(nn.Module):
     def forward(self, P, Q):
         static = self.cache and not Q.requires_grad and all(d == 1 for d in Q.shape[:-2])
         if not static:
+            if torch.is_grad_enabled() and (P.requires_grad or Q.requires_grad):
+                # Поле на детекторах для обратного прохода не храним, а пересчитываем:
+                # иначе при обучении память растёт на всё поле каждого умножения.
+                return torch.utils.checkpoint.checkpoint(self.mul, P, Q, use_reentrant=False)
             return self.mul(P, Q)
         key = self._key(Q)
         if key not in self._resp:
