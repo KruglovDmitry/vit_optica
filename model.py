@@ -174,6 +174,11 @@ class OpticContext:
         self.diag_on = False
         self.diag = collections.defaultdict(lambda: collections.defaultdict(float))
         self.doe = None                   # DOEBank (vit_optica.doe) или None
+        # Доп. знаковая калибровка: gain по форме считается на положительных матрицах,
+        # а в split сеть видит разность слагаемых, у которой лучший масштаб другой
+        # (смещение от помех в разности сокращается). Множитель s подбирается на
+        # случайных знаковых матрицах той же формы (для av — строки softmax).
+        self.calib_signed = False
         self._fam = None                  # семейство текущего умножения (proj, qk, ...)
 
     def _doe(self, term, detach=False):
@@ -218,6 +223,8 @@ class OpticContext:
             return torch.matmul(A, B)
         self._fam = tag.split('.')[-1]
         out = MODES[self.mode](self, A, B)
+        if self.calib_signed and self.mode == 'split':
+            out = out * self.signed_corr(A, B)
         if self.diag_on:
             with torch.no_grad():
                 ref = torch.matmul(A, B)
@@ -227,6 +234,20 @@ class OpticContext:
                 d['bias'] += (err.sum() / ref.abs().sum().clamp_min(1e-12)).item()
                 d['n'] += 1
         return out
+
+    @torch.no_grad()
+    def signed_corr(self, A, B):
+        key = ('signed', self._fam, A.shape[-3], A.shape[-2], A.shape[-1], B.shape[-3], B.shape[-1])
+        if key not in self._gains:
+            g = torch.Generator(device='cpu').manual_seed(1)
+            P = torch.randn(4, A.shape[-3], A.shape[-2], A.shape[-1], generator=g)
+            if bool((A >= 0).all()):                  # веса внимания
+                P = torch.softmax(2 * P, -1)
+            Q = torch.randn(1, B.shape[-3], B.shape[-2], B.shape[-1], generator=g)
+            P, Q = P.to(A.device), Q.to(A.device)
+            raw, ref = MODES[self.mode](self, P, Q), P @ Q
+            self._gains[key] = ((raw * ref).sum() / (raw * raw).sum()).item()
+        return self._gains[key]
 
     def diag_clear(self):
         self.diag.clear()

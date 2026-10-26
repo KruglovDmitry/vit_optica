@@ -62,6 +62,8 @@ def get_args():
       help='0 = gain из --gain; 1 = один gain по матрицам aperture x aperture; '
            '2 = отдельный gain для каждой формы умножения')
     a('--gain', type=float, default=1.0)
+    a('--calib_signed', type=int, default=0,
+      help='1: поверх gain по форме — множитель, подобранный на знаковых матрицах (split)')
     a('--stub_sim', action='store_true')
     a('--stub_blur', type=float, default=0.0)
     a('--noise_sigma', type=float, default=0.0)
@@ -260,6 +262,7 @@ def main():
         print(f'Калибровка gain: {gain:.4f}')
     ctx = OpticContext(args.mode, sim, gain, args.split_norm)
     ctx.per_shape_gain = sim is not None and args.calibrate == 2
+    ctx.calib_signed = bool(args.calib_signed)
 
     # ---------------------------------------------------------------- модель
     ck = None

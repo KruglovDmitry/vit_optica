@@ -60,6 +60,7 @@ def main():
     a('--batch', type=int, default=4)
     a('--lr', type=float, default=2e-2)
     a('--seed', type=int, default=0)
+    a('--calib_signed', type=int, default=1, help='знаковая калибровка при оценке (как в main.py)')
     a('--out', default='doe_fit.pt')
     args = p.parse_args()
     torch.manual_seed(args.seed)
@@ -70,6 +71,7 @@ def main():
     assert check_doe_sim(sim, dev, shapes=((args.tokens, hd, args.tokens),))
     ctx = OpticContext('split', sim, 1.0)
     ctx.per_shape_gain = True
+    ctx.calib_signed = bool(args.calib_signed)
     bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes).to(dev)
     ctx.doe = bank
     opt = torch.optim.Adam(bank.parameters(), lr=args.lr)

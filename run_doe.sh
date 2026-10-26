@@ -20,7 +20,8 @@ COMMON="--dataset cifar100 --data_dir $DATA --out_dir $OUT --seed 1337 \
   --h_dim 192 --depth 12 --heads 6 --mlp_ratio 2 --aperture 512 --distance 0.15 \
   --lens_size $L --mode split --optic_where all --calibrate 2 --sim_split $SPLIT \
   --batch_size 128 --eval_batch_size 128 --leak_tests 0"
-FT="--load_ckpt $CK --epochs $FT_EPOCHS --warmup_epochs 1 --lr 1e-4 --min_lr 1e-6 --eval_every 1"
+CS=${CS:-1}   # знаковая калибровка в дообучениях
+FT="--calib_signed $CS --load_ckpt $CK --epochs $FT_EPOCHS --warmup_epochs 1 --lr 1e-4 --min_lr 1e-6 --eval_every 1"
 
 run() {   # run <comment> <args...>
   local c="$1"; shift
@@ -36,10 +37,13 @@ case "${1:-}" in
     CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe layer --sim_split $SPLIT \
       --lens_size $L --distance 0.15 --steps 800 --out "$OUT/doe_fit_layer_s$SPLIT.pt" \
       2>&1 | tee "$OUT/log_doe_fit.txt" ;;
-  d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка)
-    run d0_nodoe --eval_only 1 --load_ckpt "$CK"
-    run d0_fit --eval_only 1 --load_ckpt "$CK" --doe layer \
-      --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" --doe_freeze 1 ;;
+  d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка),
+           # с прежней калибровкой gain и со знаковой (--calib_signed 1)
+    for CS in 0 1; do
+      run d0_nodoe_cs$CS --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
+      run d0_fit_cs$CS --eval_only 1 --load_ckpt "$CK" --doe layer --calib_signed $CS \
+        --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" --doe_freeze 1
+    done ;;
   ctrl)    # контроль: дообучение без DOE
     run ft_nodoe $FT ;;
   d1)      run ft_doe_shared $FT --doe shared --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" ;;
