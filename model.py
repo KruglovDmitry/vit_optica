@@ -104,7 +104,11 @@ def check_fast_sim(fast, device, shapes=((65, 32, 65), (65, 192, 384)), tol=1e-4
 
 
 def build_sim(stub, device, aperture=512, lens_size=16384, distance=0.15,
-              noise_sigma=0.0, stub_blur=0.0, fast=False):
+              noise_sigma=0.0, stub_blur=0.0, fast=False, doe=False,
+              split=2, lens_pix=1.8e-6):
+    """split — подотсчётов на элемент 3,6 мкм (шаг сетки 3,6/split мкм). При split = 2
+    выше NA = λ/(2·1,8 мкм) = 0,148 ошибка ложно обнуляется (results/sim_limits);
+    для DOE нужен split >= 4: фильтр, подобранный на сетке 2, подстраивается под неё."""
     if stub:
         return StubSim(noise_sigma, stub_blur).to(device)
     import source
@@ -112,10 +116,13 @@ def build_sim(stub, device, aperture=512, lens_size=16384, distance=0.15,
         right_matrix_count_columns=aperture, right_matrix_count_rows=aperture,
         right_matrix_width=3.6e-6 * aperture, right_matrix_height=3.6e-6 * aperture,
         min_height_gap=3.6e-6,
-        right_matrix_split_x=2, right_matrix_split_y=2,
-        left_matrix_split_x=2, left_matrix_split_y=2, result_matrix_split=2,
-        distance=distance, lens_size=lens_size)
+        right_matrix_split_x=split, right_matrix_split_y=split,
+        left_matrix_split_x=split, left_matrix_split_y=split, result_matrix_split=split,
+        distance=distance, lens_size=lens_size, lens_pixel_size=lens_pix)
     sim = source.OpticalMul(cfg).to(device)
+    if doe:
+        from vit_optica.doe import DOESim
+        return DOESim(sim, cfg)
     return FastSim(sim) if fast else sim
 
 
@@ -142,13 +149,13 @@ def mm_split(ctx, A, B):
     Ap, An = A.clamp(min=0), (-A).clamp(min=0)
     Bp, Bn = B.clamp(min=0), (-B).clamp(min=0)
 
-    def term(X, Y):
+    def term(X, Y, t):
         mx, my = _split_max(X, ctx.split_norm), _split_max(Y, ctx.split_norm)
-        return ctx.sim(X / mx, Y / my) * mx * my * ctx.gain_for(A, B)
+        return ctx.sim_call(X / mx, Y / my, t) * mx * my * ctx.gain_for(A, B, t)
 
-    out = term(Ap, Bp) - term(Ap, Bn)
+    out = term(Ap, Bp, 'pp') - term(Ap, Bn, 'pn')
     if bool((An > 0).any()):                     # attn-веса >= 0: два вызова вместо четырёх
-        out = out - term(An, Bp) + term(An, Bn)
+        out = out - term(An, Bp, 'np') + term(An, Bn, 'nn')
     return out
 
 
@@ -166,23 +173,50 @@ class OpticContext:
         self._gains = {}
         self.diag_on = False
         self.diag = collections.defaultdict(lambda: collections.defaultdict(float))
+        self.doe = None                   # DOEBank (vit_optica.doe) или None
+        self._fam = None                  # семейство текущего умножения (proj, qk, ...)
+
+    def _doe(self, term, detach=False):
+        if self.doe is None:
+            return None
+        gid, hx, hy = self.doe.filters(self._fam, term)
+        if detach:
+            gid = ('gain', gid)
+            hx = None if hx is None else hx.detach()
+            hy = None if hy is None else hy.detach()
+        return gid, hx, hy
+
+    def sim_call(self, P, Q, term=None):
+        doe = self._doe(term)
+        return self.sim(P, Q) if doe is None else self.sim(P, Q, doe=doe)
 
     @torch.no_grad()
-    def gain_for(self, A, B):
+    def gain_for(self, A, B, term=None):
         if not self.per_shape_gain:
             return self.gain
         key = (A.shape[-2], A.shape[-1], B.shape[-1])
+        doe = self._doe(term, detach=True)
+        if doe is not None:
+            key = key + (doe[0],)
         if key not in self._gains:
             g = torch.Generator(device='cpu').manual_seed(0)
             P = torch.rand(1, 1, *key[:2], generator=g).to(A.device)
-            Q = torch.rand(1, 1, *key[1:], generator=g).to(A.device)
-            raw, ref = self.sim(P, Q), P @ Q
-            self._gains[key] = ((raw * ref).sum() / (raw * raw).sum()).item()
+            Q = torch.rand(1, 1, *key[1:3], generator=g).to(A.device)
+            if doe is not None and doe[1] is not None and doe[1].dim() > 1:
+                # фильтр по головам: калибровка на батче голов той же формы
+                P = P.expand(1, doe[1].shape[0], *key[:2]).contiguous()
+                Q = Q.expand(1, doe[1].shape[0], *key[1:3]).contiguous()
+            raw = self.sim(P, Q) if doe is None else self.sim(P, Q, doe=doe)
+            ref = P @ Q
+            dims = (0, -2, -1)
+            gn = (raw * ref).sum(dims) / (raw * raw).sum(dims)
+            self._gains[key] = gn.item() if gn.numel() == 1 else gn.view(1, -1, 1, 1)
         return self._gains[key]
 
     def mm(self, A, B, tag, enabled=True):
         if not enabled or self.mode == 'digital' or self.force_digital:
             return torch.matmul(A, B)
+        self._fam = tag.split('.')[-1]
         out = MODES[self.mode](self, A, B)
         if self.diag_on:
             with torch.no_grad():

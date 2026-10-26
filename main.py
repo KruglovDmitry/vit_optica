@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from vit_optica.model import FastSim, check_fast_sim
+from vit_optica.doe import DOEBank, DOESim, check_doe_sim, MODES as DOE_MODES
 from vit_optica import (build_sim, OpticContext, ViT, apply_optic_where,
                         ParallelSim, check_parallel, build_datasets, build_loaders,
                         DATASET_DEFAULTS, operator_leak_tests, batch_independence_test)
@@ -67,6 +68,20 @@ def get_args():
     a('--fast_sim', type=int, default=1,
       help='1: тот же расчёт симулятора с переставленным порядком умножений (быстрее и '
            'экономнее по памяти); при старте сверяется с исходным, при расхождении — откат')
+    a('--doe', default='none', choices=DOE_MODES,
+      help='фильтр в плоскостях линз (vit_optica/doe.py): fixed — расчётный аподизатор; '
+           'shared / layer / split / head — обучаемый, общий / на семейство / на слагаемое '
+           'split / на голову (qk, av)')
+    a('--doe_axes', default='xy', choices=['xy', 'x', 'y'])
+    a('--doe_init', default='', help='начальный DOE из файла doe_fit.py (или чекпоинта)')
+    a('--doe_freeze', type=int, default=0, help='1: DOE не обучается (только веса сети)')
+    a('--doe_coef', type=int, default=32, help='косинусов на амплитуду и на фазу')
+    a('--doe_lr', type=float, default=1e-2)
+    a('--doe_refresh', type=int, default=50,
+      help='каждые N шагов пересчитывать калибровку gain под текущий DOE')
+    a('--sim_split', type=int, default=2,
+      help='подотсчётов сетки на элемент 3,6 мкм; для --doe нужно >= 4 (см. build_sim)')
+    a('--lens_pix', type=float, default=1.8e-6, help='шаг сетки линзы; апертура = lens_size·lens_pix')
     a('--sim_parallel', type=int, default=0)
     a('--sim_devices', default='')
     a('--check_parallel', type=int, default=1)
@@ -150,7 +165,7 @@ def evaluate(model, loader, device, max_batches=0, progress=''):
     return dict(loss=loss / n, acc=100 * correct / n, top5=100 * correct5 / n)
 
 
-def probe(args, model, opt, tl, device, lr_at, name_hint, warmup=3):
+def probe(args, model, opt, tl, device, lr_at, name_hint, warmup=3, ctx_doe_step=None):
     """Время итерации обучения (прямой + обратный проход) и прогноз на весь бюджет."""
     sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
     model.train()
@@ -163,6 +178,8 @@ def probe(args, model, opt, tl, device, lr_at, name_hint, warmup=3):
             it = iter(tl); x, y = next(it)
         x, y = x.to(device), y.to(device)
         sync(); t = time.time()
+        if ctx_doe_step is not None:
+            ctx_doe_step(i)
         loss = F.cross_entropy(model(x), y)
         loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
         sync()
@@ -210,10 +227,19 @@ def main():
             f'число токенов или увеличь --aperture')
     sim = None
     if args.mode != 'digital':
+        use_doe = args.doe != 'none'
+        if use_doe:
+            assert args.mode == 'split' and not args.stub_sim and not args.sim_parallel, \
+                '--doe работает с --mode split, реальным sim и без --sim_parallel'
+            assert args.calibrate == 2, '--doe требует --calibrate 2 (gain на группу DOE)'
         sim = build_sim(args.stub_sim, device, args.aperture, args.lens_size,
                         args.distance, args.noise_sigma, args.stub_blur,
-                        fast=bool(args.fast_sim) and not args.stub_sim)
-        if isinstance(sim, FastSim) and not check_fast_sim(
+                        fast=bool(args.fast_sim) and not args.stub_sim, doe=use_doe,
+                        split=args.sim_split, lens_pix=args.lens_pix)
+        if use_doe:
+            assert check_doe_sim(sim, device, shapes=((T, hd, T), (T, args.h_dim, args.h_dim * args.mlp_ratio))), \
+                'DOESim при DOE = 1 расходится с FastSim'
+        elif isinstance(sim, FastSim) and not check_fast_sim(
                 sim, device, shapes=((T, hd, T), (T, args.h_dim, args.h_dim * args.mlp_ratio))):
             print('ВНИМАНИЕ: FastSim расходится с исходным расчётом — используется исходный')
             sim = sim.sim
@@ -248,8 +274,26 @@ def main():
     model = ViT(ctx, img_size, patch, 3, n_cls, args.h_dim, args.depth, args.heads,
                 args.mlp_ratio, args.drop, args.drop_path, args.ls_init,
                 args.token_order, stem=args.stem, stem_width=args.stem_width).to(device)
+    bank = None
+    if args.mode != 'digital' and args.doe != 'none':
+        bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes).to(device)
+        model.doe = bank                     # параметры DOE попадают в state_dict и в оптимизатор
+        ctx.doe = bank
+        if args.doe_init:
+            st = torch.load(args.doe_init, map_location=device)
+            st = st.get('doe', st)
+            src = bank.load_flexible(st.get('state_dict', st))
+            print(f'DOE загружен из {args.doe_init} (группы в файле: {src})')
+        if args.doe_freeze:
+            bank.requires_grad_(False)
+        print(f'DOE: {args.doe}, оси {args.doe_axes}, групп {max(len(bank.params), 1)}, '
+              f'параметров {sum(p.numel() for p in bank.parameters())}')
     if ck is not None:
-        model.load_state_dict(ck['state_dict'], strict=True)
+        miss, extra = model.load_state_dict(ck['state_dict'], strict=False)
+        bad = [k for k in miss if not k.startswith('doe.')] + list(extra)
+        assert not bad, f'чекпоинт не совпадает с моделью: {bad[:5]}'
+        if any(k.startswith('doe.') for k in ck['state_dict']):
+            print('DOE взят из чекпоинта')
         print(f'загружены веса {args.load_ckpt} (режим обучения: {ck.get("mode")})')
     flags, blocks = apply_optic_where(model, args.optic_where if args.mode != 'digital'
                                       else 'none', args.optic_layers)
@@ -258,7 +302,12 @@ def main():
 
     # ---------------------------------------------------------------- обучение
     epochs = 0 if args.eval_only else args.epochs
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    doe_params = [p for p in bank.parameters() if p.requires_grad] if bank is not None else []
+    doe_ids = {id(p) for p in doe_params}
+    groups = [dict(params=[p for p in model.parameters() if id(p) not in doe_ids], lr_scale=1.0)]
+    if doe_params:
+        groups.append(dict(params=doe_params, weight_decay=0.0, lr_scale=args.doe_lr / args.lr))
+    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.wd)
     steps_per_epoch = max(len(tl) // args.grad_accum, 1)
     total, warm = epochs * steps_per_epoch, args.warmup_epochs * steps_per_epoch
 
@@ -268,8 +317,21 @@ def main():
         t = (s - warm) / max(total - warm, 1)
         return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * t))
 
+    def doe_step(s):
+        """Новый шаг: сбросить кэш операторов DOE; раз в doe_refresh шагов — калибровку gain."""
+        if bank is None or bank.mode == 'fixed' or args.doe_freeze:
+            return
+        bank.new_step()
+        if s % args.doe_refresh == 0:
+            ctx._gains.clear()
+
+    def doe_eval():
+        if bank is not None and bank.mode != 'fixed':
+            bank.new_step(); ctx._gains.clear()     # DOE мог измениться — пересчитать всё
+
     if args.probe_iters:
-        probe(args, model, opt, tl, device, lr_at, name_hint=f"{args.mode}_{args.comment or 'run'}")
+        probe(args, model, opt, tl, device, lr_at, name_hint=f"{args.mode}_{args.comment or 'run'}",
+              ctx_doe_step=doe_step)
         return
 
     run_name = f"{args.mode}_{args.comment or 'run'}"
@@ -301,6 +363,7 @@ def main():
         opt.zero_grad(set_to_none=True)
         for i, (x, y) in enumerate(tl):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            doe_step(step)
             use_cm = args.cutmix_prob > 0 and torch.rand(1).item() < args.cutmix_prob
             if use_cm or args.mixup_alpha > 0:
                 x, ya, yb, lam = cutmix(x, y) if use_cm else mixup(x, y, args.mixup_alpha)
@@ -313,12 +376,13 @@ def main():
             tot_loss += loss.item(); nb += 1
             if (i + 1) % args.grad_accum == 0:
                 for gp in opt.param_groups:
-                    gp['lr'] = lr_at(step)
+                    gp['lr'] = lr_at(step) * gp.get('lr_scale', 1.0)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step(); opt.zero_grad(set_to_none=True); step += 1
         rec = dict(epoch=ep + 1, train_loss=tot_loss / max(nb, 1), lr=lr_at(step),
                    epoch_sec=time.time() - te0)
         if (ep + 1) % args.eval_every == 0 or ep + 1 == epochs:
+            doe_eval()
             v = evaluate(model, vl, device, args.max_eval_batches)
             rec.update(val_acc=v['acc'], val_loss=v['loss'])
             if v['acc'] > best['acc']:
@@ -350,15 +414,18 @@ def main():
 
     # ---------------------------------------------------------------- итоговая оценка
     pr = lambda name: name if args.mode != 'digital' else ''
+    doe_eval()
     res_val = evaluate(model, vl, device, args.max_eval_batches, pr('val'))
     res_test = evaluate(model, te, device, args.max_eval_batches, pr('test'))
     res_test_best = None
     if best['state'] is not None and best['epoch'] != epochs:
         last = copy.deepcopy(model.state_dict())
         model.load_state_dict(best['state'])
+        doe_eval()
         res_test_best = dict(evaluate(model, te, device, args.max_eval_batches),
                              epoch=best['epoch'], val_acc=best['acc'])
         model.load_state_dict(last)
+        doe_eval()
 
     # послойная ошибка на одном валидационном батче
     layer_err = {}
@@ -409,7 +476,10 @@ def main():
         torch.save(dict(mode=args.mode, state_dict=model.state_dict(),
                         best_state_dict=best['state'], config=vars(args),
                         gain=gain, test=res_test), out / f'ckpt_{name}.pt')
-    res = dict(gains_per_shape={str(k): v for k, v in ctx._gains.items()},
+    gval = lambda v: v if isinstance(v, float) else v.flatten().tolist()
+    res = dict(gains_per_shape={str(k): gval(v) for k, v in ctx._gains.items()},
+               doe=dict(mode=args.doe, axes=args.doe_axes, coef=args.doe_coef,
+                        lr=args.doe_lr, filters=bank.describe()) if bank is not None else None,
                args=vars(args), dataset=args.dataset, mode=args.mode,
                optic_where=args.optic_where, optic_blocks=blocks,
                lens_size=args.lens_size, split_norm=args.split_norm,
