@@ -14,12 +14,16 @@ SPLIT=${SPLIT:-4}
 L=${L:-16384}
 FT_EPOCHS=${FT_EPOCHS:-10}
 PY=${PY:-python}
+# обучение через оптику со всеми 12 блоками при батче 128 не влезает в 80 ГБ:
+# батч 64 с накоплением 2 (эффективно те же 128)
+BS=${BS:-64}
+ACC=${ACC:-2}
 mkdir -p "$OUT"
 
 COMMON="--dataset cifar100 --data_dir $DATA --out_dir $OUT --seed 1337 \
   --h_dim 192 --depth 12 --heads 6 --mlp_ratio 2 --aperture 512 --distance 0.15 \
   --lens_size $L --mode split --optic_where all --calibrate 2 --sim_split $SPLIT \
-  --batch_size 128 --eval_batch_size 128 --leak_tests 0"
+  --batch_size $BS --grad_accum $ACC --eval_batch_size 128 --leak_tests 0"
 CS=${CS:-1}   # знаковая калибровка в дообучениях
 FT="--calib_signed $CS --load_ckpt $CK --epochs $FT_EPOCHS --warmup_epochs 1 --lr 1e-4 --min_lr 1e-6 --eval_every 1"
 
