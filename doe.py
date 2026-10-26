@@ -98,10 +98,16 @@ class DOESim(FastSim):
         _, X2 = self._slices(sim._propagator_two, mat.shape[-2:], (mat.size(-2), 1))
         X1, Y2 = self.operators(gid, hx, hy, vec.shape[-2:], mat.shape[-2:])
         y = (Y1 @ vec.new_ones(vec.shape[-2], 1)).squeeze(-1)
-        g = vec[..., :1, :] @ X1                                  # (..., M, 1, 2K)
-        u = g.squeeze(-2) * X2.squeeze(-1)
+        if X1.dim() == 2:
+            g = (vec[..., :1, :] @ X1).squeeze(-2)                # (..., M, 2K)
+        else:   # свой фильтр на голову: einsum, иначе matmul размножит X1 на батч и строки
+            g = torch.einsum('...hmi,hik->...hmk', vec[..., 0, :], X1.squeeze(-3))
+        u = g * X2.squeeze(-1)
         h = (u @ mat.squeeze(-3).transpose(-1, -2)) * y
-        out = h @ Y2.transpose(-1, -2)
+        if Y2.dim() == 2:
+            out = h @ Y2.transpose(-1, -2)
+        else:
+            out = torch.einsum('...hmn,hon->...hmo', h, Y2)
         return sim.prepare_out(out.unsqueeze(-1))
 
 
