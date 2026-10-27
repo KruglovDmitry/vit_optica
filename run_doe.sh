@@ -4,7 +4,8 @@
 # Сетка симулятора split 4 (δ = 0,9 мкм): на сетке 2 DOE подстраивается под её артефакт.
 #
 #   CK=/path/ckpt_digital_patch_s1337.pt DATA=/path/data GPU=0 bash vit_optica/run_doe.sh probe
-#   фазы: probe | fit | d0 | ctrl | d1 | d2 | d3 | d4
+#   фазы: probe | fit | d0 | ctrl | d1 | d2 | d3 | d4 | d5_frozen | d5_train | d5_nodoe | d5_digital
+#   другая линза: L=8192 bash run_doe.sh fit, затем L=8192 bash run_doe.sh d0
 set -e
 CK=${CK:?"задай CK — цифровой чекпоинт digital_patch_s1337"}
 DATA=${DATA:?"задай DATA — папка с CIFAR-100"}
@@ -19,6 +20,10 @@ PY=${PY:-python}
 BS=${BS:-64}
 ACC=${ACC:-2}
 mkdir -p "$OUT"
+LT=$([[ "$L" == 16384 ]] && echo "" || echo "_L$L")    # метка линзы в именах файлов
+FIT=${FIT:-$OUT/doe_fit_layer_s$SPLIT$LT.pt}
+EPOCHS=${EPOCHS:-100}       # обучение с нуля (D5)
+SCR="--epochs $EPOCHS --warmup_epochs 10 --lr 1e-3 --eval_every 5"
 
 COMMON="--dataset cifar100 --data_dir $DATA --out_dir $OUT --seed 1337 \
   --h_dim 192 --depth 12 --heads 6 --mlp_ratio 2 --aperture 512 --distance 0.15 \
@@ -39,20 +44,26 @@ case "${1:-}" in
     run probe_doe_layer $FT --doe layer --probe_iters 20 ;;
   fit)     # D0, шаг 1: DOE на ошибку умножения, без сети (минуты)
     CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe layer --sim_split $SPLIT \
-      --lens_size $L --distance 0.15 --steps 800 --out "$OUT/doe_fit_layer_s$SPLIT.pt" \
+      --lens_size $L --distance 0.15 --steps 800 --out "$FIT" \
       2>&1 | tee "$OUT/log_doe_fit.txt" ;;
   d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка),
            # с прежней калибровкой gain и со знаковой (--calib_signed 1)
     for CS in 0 1; do
-      run d0_nodoe_cs$CS --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
-      run d0_fit_cs$CS --eval_only 1 --load_ckpt "$CK" --doe layer --calib_signed $CS \
-        --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" --doe_freeze 1
+      run d0_nodoe_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
+      run d0_fit_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --doe layer --calib_signed $CS \
+        --doe_init "$FIT" --doe_freeze 1
     done ;;
   ctrl)    # контроль: дообучение без DOE
     run ft_nodoe $FT ;;
-  d1)      run ft_doe_shared $FT --doe shared --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" ;;
-  d2)      run ft_doe_layer  $FT --doe layer  --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" ;;
-  d3)      run ft_doe_split  $FT --doe split  --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" ;;
-  d4)      run ft_doe_head   $FT --doe head   --doe_init "$OUT/doe_fit_layer_s$SPLIT.pt" ;;
-  *) echo "usage: CK=... DATA=... bash run_doe.sh [probe|fit|d0|ctrl|d1|d2|d3|d4]"; exit 1 ;;
+  d1)      run ft_doe_shared $FT --doe shared --doe_init "$FIT" ;;
+  d2)      run ft_doe_layer  $FT --doe layer  --doe_init "$FIT" ;;
+  d3)      run ft_doe_split  $FT --doe split  --doe_init "$FIT" ;;
+  d4)      run ft_doe_head   $FT --doe head   --doe_init "$FIT" ;;
+  # D5: с нуля через оптику; DOE из подбора — заморожен или учится вместе с сетью
+  d5_frozen) run scr_doe_frozen$LT $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_freeze 1 ;;
+  d5_train)  run scr_doe_train$LT $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_lr 1e-3 ;;
+  d5_nodoe)  run scr_nodoe$LT $SCR --calib_signed $CS ;;   # контроль: оптика без DOE
+  d5_digital)   # цифровой эталон на тех же эпохах
+    run scr_digital_e$EPOCHS $SCR --mode digital ;;
+  *) echo "usage: CK=... DATA=... bash run_doe.sh [probe|fit|d0|ctrl|d1|d2|d3|d4|d5_frozen|d5_train|d5_nodoe|d5_digital]"; exit 1 ;;
 esac
