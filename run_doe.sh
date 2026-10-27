@@ -4,7 +4,7 @@
 # Сетка симулятора split 4 (δ = 0,9 мкм): на сетке 2 DOE подстраивается под её артефакт.
 #
 #   CK=/path/ckpt_digital_patch_s1337.pt DATA=/path/data GPU=0 bash vit_optica/run_doe.sh probe
-#   фазы: probe | fit | d0 | ctrl | d1 | d2 | d3 | d4 | d5_frozen | d5_train | d5_nodoe | d5_digital
+#   фазы: probe | fit | d0 | ctrl | d1 | d2 | d3 | d4 | d5_frozen | d5_train | d5_nodoe | d5_clear | d5_digital
 #   другая линза: L=8192 bash run_doe.sh fit, затем L=8192 bash run_doe.sh d0
 set -e
 CK=${CK:?"задай CK — цифровой чекпоинт digital_patch_s1337"}
@@ -66,7 +66,8 @@ case "${1:-}" in
   d5_frozen) run scr_doe_frozen$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_freeze 1 ;;
   d5_train)  run scr_doe_train$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_lr 1e-3 ;;
   d5_nodoe)  run scr_nodoe$LT$ST $SCR --calib_signed $CS ;;   # контроль: оптика без DOE
+  d5_clear)  run scr_clear$LT$ST $SCR --calib_signed $CS --doe layer --doe_freeze 1 ;;   # тот же контроль через DOESim: прозрачный DOE (A≈0,98, φ=0), быстрее
   d5_digital)   # цифровой эталон на тех же эпохах
     run scr_digital_e$EPOCHS$ST $SCR --mode digital ;;
-  *) echo "usage: CK=... DATA=... bash run_doe.sh [probe|fit|d0|ctrl|d1|d2|d3|d4|d5_frozen|d5_train|d5_nodoe|d5_digital]"; exit 1 ;;
+  *) echo "usage: CK=... DATA=... bash run_doe.sh [probe|fit|d0|ctrl|d1|d2|d3|d4|d5_frozen|d5_train|d5_nodoe|d5_clear|d5_digital]"; exit 1 ;;
 esac
