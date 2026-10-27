@@ -15,6 +15,7 @@ SPLIT=${SPLIT:-4}
 L=${L:-16384}
 FT_EPOCHS=${FT_EPOCHS:-10}
 PY=${PY:-python}
+EXTRA=${EXTRA:-}   # доп. аргументы main.py (ставятся последними)
 # обучение через оптику со всеми 12 блоками при батче 128 не влезает в 80 ГБ:
 # батч 64 с накоплением 2 (эффективно те же 128)
 BS=${BS:-64}
@@ -35,7 +36,7 @@ FT="--calib_signed $CS --load_ckpt $CK --epochs $FT_EPOCHS --warmup_epochs 1 --l
 run() {   # run <comment> <args...>
   local c="$1"; shift
   echo ">>> [$(date +%H:%M:%S)] $c"
-  CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.main $COMMON "$@" --comment "$c" 2>&1 | tee "$OUT/log_$c.txt"
+  CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.main $COMMON "$@" $EXTRA --comment "$c" 2>&1 | tee "$OUT/log_$c.txt"
 }
 
 case "${1:-}" in
