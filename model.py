@@ -180,6 +180,9 @@ class OpticContext:
         # случайных знаковых матрицах той же формы (для av — строки softmax).
         self.calib_signed = False
         self._fam = None                  # семейство текущего умножения (proj, qk, ...)
+        # шум детектора: аддитивный гауссов, σ — доля полной шкалы выхода БЕЗ маски
+        # (маска ослабляет сигнал, шум остаётся; gain его потом усиливает)
+        self.det_noise = 0.0
 
     def _doe(self, term, detach=False):
         if self.doe is None:
@@ -193,7 +196,13 @@ class OpticContext:
 
     def sim_call(self, P, Q, term=None):
         doe = self._doe(term)
-        return self.sim(P, Q) if doe is None else self.sim(P, Q, doe=doe)
+        out = self.sim(P, Q) if doe is None else self.sim(P, Q, doe=doe)
+        if self.det_noise > 0:
+            with torch.no_grad():
+                ref = out if doe is None else self.sim(P, Q)
+                fs = ref.abs().amax(dim=(-2, -1), keepdim=True)
+            out = out + self.det_noise * fs * torch.randn_like(out)
+        return out
 
     @torch.no_grad()
     def gain_for(self, A, B, term=None):

@@ -88,6 +88,11 @@ def get_args():
     a('--doe_freeze', type=int, default=0, help='1: DOE не обучается (только веса сети)')
     a('--doe_coef', type=int, default=32, help='косинусов на амплитуду и на фазу')
     a('--doe_lr', type=float, default=1e-2)
+    # допуски фиксированной маски (только для оценки, вместе с --doe_freeze 1)
+    a('--doe_shift_mm', type=float, nargs=2, default=(0.0, 0.0), help='сдвиг маски у L1 (x) и L3 (y), мм')
+    a('--doe_quant', type=int, default=0, help='уровней амплитуды на [0, 1]; 0 — без квантования')
+    a('--doe_amp_err', type=float, default=0.0, help='относит. ошибка амплитуды (корр. 1 мм)')
+    a('--det_noise', type=float, default=0.0, help='шум детектора, доля полной шкалы без маски')
     a('--doe_refresh', type=int, default=50,
       help='каждые N шагов пересчитывать калибровку gain под текущий DOE')
     a('--sim_split', type=int, default=2,
@@ -294,6 +299,7 @@ def main():
     ctx = OpticContext(args.mode, sim, gain, args.split_norm)
     ctx.per_shape_gain = sim is not None and args.calibrate == 2
     ctx.calib_signed = bool(args.calib_signed)
+    ctx.det_noise = args.det_noise
 
     # ---------------------------------------------------------------- модель
     ck = None
@@ -321,6 +327,10 @@ def main():
             print(f'DOE загружен из {args.doe_init} (группы в файле: {src})')
         if args.doe_freeze:
             bank.requires_grad_(False)
+        if any(args.doe_shift_mm) or args.doe_quant or args.doe_amp_err:
+            bank.set_errors(tuple(args.doe_shift_mm), args.doe_quant, args.doe_amp_err)
+            print(f'DOE с погрешностями: сдвиг {args.doe_shift_mm} мм, уровней {args.doe_quant}, '
+                  f'ошибка амплитуды {args.doe_amp_err}')
         print(f'DOE: {args.doe}, оси {args.doe_axes}, групп {max(len(bank.params), 1)}, '
               f'параметров {sum(p.numel() for p in bank.parameters())}')
     if ck is not None:

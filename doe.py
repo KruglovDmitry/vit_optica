@@ -159,6 +159,7 @@ class DOEBank(nn.Module):
         super().__init__()
         assert mode in MODES and mode != 'none' and kind in self.KINDS
         self.mode, self.heads, self.axes, self.kind = mode, heads, axes, kind
+        self.err = None                                  # погрешности изготовления, set_errors
         self.dsim = [dsim]                               # не регистрируем как подмодуль
         xi = dsim.xi
         xn = xi / xi.abs().max()
@@ -204,12 +205,49 @@ class DOEBank(nn.Module):
         p = self.params[gid]
         c = torch.einsum('naqk,kl->naql', p, self.basis)          # (n, 2, 2, L)
         A, phi = self._amp_phase(c)
+        if self.err is not None:
+            A, phi = self._apply_errors(A, phi)
         h = A * torch.exp(1j * phi)                                # (n, 2, L)
         if h.shape[0] == 1:
             hx, hy = h[0, 0], h[0, 1]
         else:   # головы: X1 должен иметь батч (heads, 1) под (B, heads, M), Y2 — (heads,)
             hx, hy = h[:, 0, None, :], h[:, 1]
         return (gid, hx if 'x' in self.axes else None, hy if 'y' in self.axes else None)
+
+    def set_errors(self, shift_mm=(0.0, 0.0), quant=0, amp_err=0.0, corr_mm=1.0, seed=0):
+        """Погрешности изготовления и юстировки фиксированной маски (для оценки допусков).
+        shift_mm — сдвиг маски поперёк оси (x у L1, y у L3), мм; quant — число уровней
+        амплитуды на [0, 1] (0 = без квантования); amp_err — относительная ошибка амплитуды
+        (гауссова, сглаженная с корреляцией corr_mm), одна реализация на seed."""
+        xi = self.dsim[0].xi
+        pix = float(xi[1] - xi[0])
+        L = xi.numel()
+        idx = []
+        for s in shift_mm:
+            k = int(round(s * 1e-3 / pix))
+            idx.append((torch.arange(L) - k).clamp(0, L - 1))     # край маски продолжается
+        noise = None
+        if amp_err > 0:
+            g = torch.Generator().manual_seed(seed)
+            w = torch.randn(2, L, generator=g)
+            r = max(int(corr_mm * 1e-3 / pix), 1)
+            ker = torch.exp(-0.5 * (torch.arange(-3 * r, 3 * r + 1) / r) ** 2)
+            w = torch.nn.functional.conv1d(w[:, None], (ker / ker.norm())[None, None],
+                                           padding=3 * r)[:, 0]
+            noise = amp_err * w / w.std()
+        dev = self.basis.device
+        self.err = dict(idx=[i.to(dev) for i in idx], quant=quant,
+                        noise=None if noise is None else noise.to(dev))
+
+    def _apply_errors(self, A, phi):
+        e = self.err
+        A = torch.stack([A[:, a].index_select(-1, e['idx'][a]) for a in range(2)], 1)
+        phi = torch.stack([phi[:, a].index_select(-1, e['idx'][a]) for a in range(2)], 1)
+        if e['noise'] is not None:
+            A = (A * (1 + e['noise'])).clamp(0, 1)
+        if e['quant']:
+            A = torch.round(A * (e['quant'] - 1)) / (e['quant'] - 1)
+        return A, phi
 
     def _amp_phase(self, c):
         A = torch.sigmoid(c[:, :, 0]) if self.kind != 'phase' else torch.ones_like(c[:, :, 0])
