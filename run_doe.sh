@@ -48,7 +48,7 @@ case "${1:-}" in
   fit)     # D0, шаг 1: DOE на ошибку умножения, без сети (минуты)
     CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe layer --sim_split $SPLIT \
       --lens_size $L --distance 0.15 --steps 800 --out "$FIT" \
-      2>&1 | tee "$OUT/log_doe_fit.txt" ;;
+      2>&1 | tee "$OUT/log_doe_fit$LT.txt" ;;
   d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка),
            # с прежней калибровкой gain и со знаковой (--calib_signed 1)
     for CS in 0 1; do
