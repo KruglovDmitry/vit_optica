@@ -21,12 +21,14 @@ EXTRA=${EXTRA:-}   # доп. аргументы main.py (ставятся пос
 BS=${BS:-64}
 ACC=${ACC:-2}
 mkdir -p "$OUT"
+SEED=${SEED:-1337}
+ST=$([[ "$SEED" == 1337 ]] && echo "" || echo "_s$SEED")   # метка сида
 LT=$([[ "$L" == 16384 ]] && echo "" || echo "_L$L")    # метка линзы в именах файлов
 FIT=${FIT:-$OUT/doe_fit_layer_s$SPLIT$LT.pt}
 EPOCHS=${EPOCHS:-100}       # обучение с нуля (D5)
 SCR="--epochs $EPOCHS --warmup_epochs 10 --lr 1e-3 --eval_every 5"
 
-COMMON="--dataset cifar100 --data_dir $DATA --out_dir $OUT --seed 1337 \
+COMMON="--dataset cifar100 --data_dir $DATA --out_dir $OUT --seed $SEED \
   --h_dim 192 --depth 12 --heads 6 --mlp_ratio 2 --aperture 512 --distance 0.15 \
   --lens_size $L --mode split --optic_where all --calibrate 2 --sim_split $SPLIT \
   --batch_size $BS --grad_accum $ACC --eval_batch_size 128 --leak_tests 0"
@@ -61,10 +63,10 @@ case "${1:-}" in
   d3)      run ft_doe_split  $FT --doe split  --doe_init "$FIT" ;;
   d4)      run ft_doe_head   $FT --doe head   --doe_init "$FIT" ;;
   # D5: с нуля через оптику; DOE из подбора — заморожен или учится вместе с сетью
-  d5_frozen) run scr_doe_frozen$LT $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_freeze 1 ;;
-  d5_train)  run scr_doe_train$LT $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_lr 1e-3 ;;
-  d5_nodoe)  run scr_nodoe$LT $SCR --calib_signed $CS ;;   # контроль: оптика без DOE
+  d5_frozen) run scr_doe_frozen$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_freeze 1 ;;
+  d5_train)  run scr_doe_train$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_lr 1e-3 ;;
+  d5_nodoe)  run scr_nodoe$LT$ST $SCR --calib_signed $CS ;;   # контроль: оптика без DOE
   d5_digital)   # цифровой эталон на тех же эпохах
-    run scr_digital_e$EPOCHS $SCR --mode digital ;;
+    run scr_digital_e$EPOCHS$ST $SCR --mode digital ;;
   *) echo "usage: CK=... DATA=... bash run_doe.sh [probe|fit|d0|ctrl|d1|d2|d3|d4|d5_frozen|d5_train|d5_nodoe|d5_digital]"; exit 1 ;;
 esac
