@@ -82,6 +82,8 @@ def get_args():
            'shared / layer / split / head — обучаемый, общий / на семейство / на слагаемое '
            'split / на голову (qk, av)')
     a('--doe_axes', default='xy', choices=['xy', 'x', 'y'])
+    a('--doe_kind', default='complex', choices=DOEBank.KINDS,
+      help='complex | phase (только рельеф) | amp (только серая маска)')
     a('--doe_init', default='', help='начальный DOE из файла doe_fit.py (или чекпоинта)')
     a('--doe_freeze', type=int, default=0, help='1: DOE не обучается (только веса сети)')
     a('--doe_coef', type=int, default=32, help='косинусов на амплитуду и на фазу')
@@ -308,7 +310,8 @@ def main():
                 args.token_order, stem=args.stem, stem_width=args.stem_width).to(device)
     bank = None
     if args.mode != 'digital' and args.doe != 'none':
-        bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes).to(device)
+        bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes,
+                       kind=args.doe_kind).to(device)
         model.doe = bank                     # параметры DOE попадают в state_dict и в оптимизатор
         ctx.doe = bank
         if args.doe_init:
@@ -531,7 +534,7 @@ def main():
                         gain=gain, test=res_test), out / f'ckpt_{name}.pt')
     gval = lambda v: v if isinstance(v, float) else v.flatten().tolist()
     res = dict(gains_per_shape={str(k): gval(v) for k, v in ctx._gains.items()},
-               doe=dict(mode=args.doe, axes=args.doe_axes, coef=args.doe_coef,
+               doe=dict(mode=args.doe, kind=args.doe_kind, axes=args.doe_axes, coef=args.doe_coef,
                         lr=args.doe_lr, filters=bank.describe()) if bank is not None else None,
                args=vars(args), dataset=args.dataset, mode=args.mode,
                optic_where=args.optic_where, optic_blocks=blocks,

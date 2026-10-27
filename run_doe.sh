@@ -26,7 +26,9 @@ SEED=${SEED:-1337}
 ST=$([[ "$SEED" == 1337 ]] && echo "" || echo "_s$SEED")   # метка сида
 LT=$([[ "$L" == 16384 ]] && echo "" || echo "_L$L")    # метка линзы в именах файлов
 DOE_MODE=${DOE_MODE:-layer}   # режим DOE для fit и d0 (layer | shared)
-FIT=${FIT:-$OUT/doe_fit_${DOE_MODE}_s$SPLIT$LT.pt}
+DOE_KIND=${DOE_KIND:-complex}  # complex | phase (только рельеф) | amp (только амплитуда)
+KT=$([[ "$DOE_KIND" == complex ]] && echo "" || echo "_$DOE_KIND")
+FIT=${FIT:-$OUT/doe_fit_${DOE_MODE}${KT}_s$SPLIT$LT.pt}
 EPOCHS=${EPOCHS:-100}       # обучение с нуля (D5)
 SCR="--epochs $EPOCHS --warmup_epochs 10 --lr 1e-3 --eval_every 5"
 
@@ -52,14 +54,15 @@ case "${1:-}" in
     run probe_nodoe $FT --probe_iters 20
     run probe_doe_layer $FT --doe layer --probe_iters 20 ;;
   fit)     # D0, шаг 1: DOE на ошибку умножения, без сети (минуты)
-    CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe $DOE_MODE --sim_split $SPLIT \
+    CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe $DOE_MODE --doe_kind $DOE_KIND --sim_split $SPLIT \
       --lens_size $L --distance 0.15 --steps 800 --out "$FIT" \
-      2>&1 | tee "$OUT/log_doe_fit_$DOE_MODE$LT.txt" ;;
+      2>&1 | tee "$OUT/log_doe_fit_$DOE_MODE$KT$LT.txt" ;;
   d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка),
            # с прежней калибровкой gain и со знаковой (--calib_signed 1)
-    for CS in 0 1; do
-      run d0_nodoe_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
-      run d0_fit_${DOE_MODE}_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --doe $DOE_MODE --calib_signed $CS \
+    for CS in ${D0_CS:-0 1}; do                        # D0_CS=1 — только знаковая калибровка
+      [[ "${D0_NODOE:-1}" == 1 ]] && run d0_nodoe_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
+      run d0_fit_${DOE_MODE}${KT}_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --doe $DOE_MODE \
+        --doe_kind $DOE_KIND --calib_signed $CS \
         --doe_init "$FIT" --doe_freeze 1
     done ;;
   ctrl)    # контроль: дообучение без DOE

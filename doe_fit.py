@@ -46,6 +46,7 @@ def main():
     a = p.add_argument
     a('--doe', default='layer', choices=['shared', 'layer', 'split', 'head'])
     a('--doe_axes', default='xy')
+    a('--doe_kind', default='complex', choices=DOEBank.KINDS)
     a('--doe_coef', type=int, default=32)
     a('--aperture', type=int, default=512)
     a('--lens_size', type=int, default=16384)
@@ -72,7 +73,8 @@ def main():
     ctx = OpticContext('split', sim, 1.0)
     ctx.per_shape_gain = True
     ctx.calib_signed = bool(args.calib_signed)
-    bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes).to(dev)
+    bank = DOEBank(sim, args.doe, args.doe_coef, args.heads, args.doe_axes,
+                   kind=args.doe_kind).to(dev)
     ctx.doe = bank
     opt = torch.optim.Adam(bank.parameters(), lr=args.lr)
     shp = shapes(args.tokens, args.h_dim, hd, args.mlp_ratio)

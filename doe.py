@@ -150,11 +150,15 @@ class DOEBank(nn.Module):
           split  — свой на семейство и слагаемое split (pp, pn, np, nn);
           head   — свой на семейство, для qk и av ещё и на каждую голову.
     axes: 'xy', 'x' или 'y' — какие оси фильтруются.
+    kind: complex — амплитуда и фаза; phase — только фаза (A = 1, чистый рельеф);
+          amp — только амплитуда (φ = 0, серая маска).
     """
-    def __init__(self, dsim, mode, n_coef=32, heads=6, axes='xy', pitch=3.6e-6):
+    KINDS = ('complex', 'phase', 'amp')
+
+    def __init__(self, dsim, mode, n_coef=32, heads=6, axes='xy', pitch=3.6e-6, kind='complex'):
         super().__init__()
-        assert mode in MODES and mode != 'none'
-        self.mode, self.heads, self.axes = mode, heads, axes
+        assert mode in MODES and mode != 'none' and kind in self.KINDS
+        self.mode, self.heads, self.axes, self.kind = mode, heads, axes, kind
         self.dsim = [dsim]                               # не регистрируем как подмодуль
         xi = dsim.xi
         xn = xi / xi.abs().max()
@@ -199,12 +203,18 @@ class DOEBank(nn.Module):
             return gid, hx, hy
         p = self.params[gid]
         c = torch.einsum('naqk,kl->naql', p, self.basis)          # (n, 2, 2, L)
-        h = torch.sigmoid(c[:, :, 0]) * torch.exp(1j * c[:, :, 1])  # (n, 2, L)
+        A, phi = self._amp_phase(c)
+        h = A * torch.exp(1j * phi)                                # (n, 2, L)
         if h.shape[0] == 1:
             hx, hy = h[0, 0], h[0, 1]
         else:   # головы: X1 должен иметь батч (heads, 1) под (B, heads, M), Y2 — (heads,)
             hx, hy = h[:, 0, None, :], h[:, 1]
         return (gid, hx if 'x' in self.axes else None, hy if 'y' in self.axes else None)
+
+    def _amp_phase(self, c):
+        A = torch.sigmoid(c[:, :, 0]) if self.kind != 'phase' else torch.ones_like(c[:, :, 0])
+        phi = c[:, :, 1] if self.kind != 'amp' else torch.zeros_like(c[:, :, 1])
+        return A, phi
 
     @torch.no_grad()
     def load_flexible(self, state):
@@ -232,7 +242,7 @@ class DOEBank(nn.Module):
         out = {}
         for g, p in self.params.items():
             c = torch.einsum('naqk,kl->naql', p, self.basis)
-            A = torch.sigmoid(c[:, :, 0])
+            A, phi = self._amp_phase(c)
             out[g] = dict(mean_amp=A.mean().item(), power=(A ** 2).mean().item(),
-                          phase_rms=c[:, :, 1].std().item())
+                          phase_rms=phi.std().item())
         return out
