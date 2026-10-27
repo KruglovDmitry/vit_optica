@@ -72,7 +72,9 @@ case "${1:-}" in
   d3)      run ft_doe_split  $FT --doe split  --doe_init "$FIT" ;;
   d4)      run ft_doe_head   $FT --doe head   --doe_init "$FIT" ;;
   # D5: с нуля через оптику; DOE из подбора — заморожен или учится вместе с сетью
-  d5_frozen) run scr_doe_frozen$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_freeze 1 ;;
+  d5_frozen) MT=$([[ "$DOE_MODE" == layer ]] && echo "" || echo "_$DOE_MODE")
+    run scr_doe_frozen$MT$KT$LT$ST $SCR --calib_signed $CS --doe $DOE_MODE --doe_kind $DOE_KIND \
+      --doe_init "$FIT" --doe_freeze 1 ;;
   d5_train)  run scr_doe_train$LT$ST $SCR --calib_signed $CS --doe layer --doe_init "$FIT" --doe_lr 1e-3 ;;
   d5_nodoe)  run scr_nodoe$LT$ST $SCR --calib_signed $CS ;;   # контроль: оптика без DOE
   d5_clear)  run scr_clear$LT$ST $SCR --calib_signed $CS --doe layer --doe_freeze 1 ;;   # тот же контроль через DOESim: прозрачный DOE (A≈0,98, φ=0), быстрее
