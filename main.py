@@ -9,14 +9,21 @@
       --eval_only 1 --load_ckpt runs_vit/ckpt_digital_digi.pt --lens_size 16384 --comment inf
 """
 import argparse
+import builtins
+import contextlib
 import copy
+import datetime
 import json
 import math
+import os
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 from vit_optica.model import FastSim, check_fast_sim
 from vit_optica.doe import DOEBank, DOESim, check_doe_sim, MODES as DOE_MODES
@@ -199,9 +206,24 @@ def probe(args, model, opt, tl, device, lr_at, name_hint, warmup=3, ctx_doe_step
 
 def main():
     args = get_args()
+    # DDP: запуск через torchrun (WORLD_SIZE > 1). Каждый процесс держит свою копию сети и
+    # симулятора на своей карте, батч делится между процессами, градиенты усредняются.
+    # Эффективный батч = batch_size · grad_accum · число процессов.
+    world = int(os.environ.get('WORLD_SIZE', 1))
+    rank = int(os.environ.get('RANK', 0))
+    if world > 1:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+        dist.init_process_group('nccl' if torch.cuda.is_available() else 'gloo',
+                                timeout=datetime.timedelta(hours=3))  # eval идёт на rank 0
+        assert not args.sim_parallel, 'DDP и --sim_parallel вместе не поддерживаются'
+        if rank != 0:
+            builtins.print = lambda *a, **k: None
     torch.manual_seed(args.seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
+    device = f'cuda:{torch.cuda.current_device()}' if torch.cuda.is_available() else 'cpu'
+    if world > 1:
+        print(f'DDP: процессов {world}, эффективный батч {args.batch_size * args.grad_accum * world}')
+    if device.startswith('cuda'):
         print(f'Устройство: cuda:{torch.cuda.current_device()} '
               f'({torch.cuda.get_device_name()}), видно карт: {torch.cuda.device_count()}')
     else:
@@ -216,6 +238,13 @@ def main():
         img_size=args.img_size or None)
     tl, vl, te = build_loaders(train, val, test, args.batch_size, args.eval_batch_size,
                                args.workers, args.seed)
+    sampler = None
+    if world > 1:
+        sampler = DistributedSampler(train, num_replicas=world, rank=rank, shuffle=True,
+                                     seed=args.seed, drop_last=True)
+        tl = DataLoader(train, args.batch_size, sampler=sampler, drop_last=True,
+                        num_workers=args.workers, pin_memory=torch.cuda.is_available(),
+                        persistent_workers=args.workers > 0)
     print(f'Данные: {args.dataset}, {img_size}x{img_size}, патч {patch}, классов {n_cls}; '
           f'train {len(train)}, val {len(val)}, test {len(test)}')
 
@@ -301,6 +330,11 @@ def main():
     flags, blocks = apply_optic_where(model, args.optic_where if args.mode != 'digital'
                                       else 'none', args.optic_layers)
     n_params = sum(p.numel() for p in model.parameters())
+    net = model
+    if world > 1 and not args.eval_only:
+        net = DDP(model, device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None,
+                  broadcast_buffers=False)
+        torch.manual_seed(args.seed + rank)            # свои cutmix и drop_path в каждом процессе
     print(f'Параметров: {n_params / 1e6:.2f}M, токенов {T}, размерность головы {hd}')
 
     # ---------------------------------------------------------------- обучение
@@ -333,7 +367,7 @@ def main():
             bank.new_step(); ctx._gains.clear()     # DOE мог измениться — пересчитать всё
 
     if args.probe_iters:
-        probe(args, model, opt, tl, device, lr_at, name_hint=f"{args.mode}_{args.comment or 'run'}",
+        probe(args, net, opt, tl, device, lr_at, name_hint=f"{args.mode}_{args.comment or 'run'}",
               ctx_doe_step=doe_step)
         return
 
@@ -342,6 +376,8 @@ def main():
     if args.tensorboard:
         try:
             from torch.utils.tensorboard import SummaryWriter
+            if rank != 0:
+                raise ImportError                       # кривые пишет только rank 0
             tb = SummaryWriter(Path(args.out_dir) / 'tb' / run_name)
             tb.add_text('config', json.dumps(vars(args), ensure_ascii=False, indent=1))
         except ImportError:
@@ -361,23 +397,29 @@ def main():
         print(f'ПРОДОЛЖЕНИЕ с эпохи {start_ep + 1} из {last_path}')
     model.train()
     for ep in range(start_ep, epochs):
+        if sampler is not None:
+            sampler.set_epoch(ep)
         te0 = time.time()
         tot_loss, nb = 0.0, 0
         opt.zero_grad(set_to_none=True)
         for i, (x, y) in enumerate(tl):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             doe_step(step)
+            sync = (i + 1) % args.grad_accum == 0
+            ns = net.no_sync() if (world > 1 and not sync) else contextlib.nullcontext()
             use_cm = args.cutmix_prob > 0 and torch.rand(1).item() < args.cutmix_prob
             if use_cm or args.mixup_alpha > 0:
                 x, ya, yb, lam = cutmix(x, y) if use_cm else mixup(x, y, args.mixup_alpha)
-                logits = model(x)                           # один прямой проход
-                loss = (lam * F.cross_entropy(logits, ya, label_smoothing=args.label_smoothing)
-                        + (1 - lam) * F.cross_entropy(logits, yb, label_smoothing=args.label_smoothing))
-            else:
-                loss = F.cross_entropy(model(x), y, label_smoothing=args.label_smoothing)
-            (loss / args.grad_accum).backward()
+            with ns:
+                if use_cm or args.mixup_alpha > 0:
+                    logits = net(x)                         # один прямой проход
+                    loss = (lam * F.cross_entropy(logits, ya, label_smoothing=args.label_smoothing)
+                            + (1 - lam) * F.cross_entropy(logits, yb, label_smoothing=args.label_smoothing))
+                else:
+                    loss = F.cross_entropy(net(x), y, label_smoothing=args.label_smoothing)
+                (loss / args.grad_accum).backward()
             tot_loss += loss.item(); nb += 1
-            if (i + 1) % args.grad_accum == 0:
+            if sync:
                 for gp in opt.param_groups:
                     gp['lr'] = lr_at(step) * gp.get('lr_scale', 1.0)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -386,11 +428,14 @@ def main():
                    epoch_sec=time.time() - te0)
         if (ep + 1) % args.eval_every == 0 or ep + 1 == epochs:
             doe_eval()
-            v = evaluate(model, vl, device, args.max_eval_batches)
-            rec.update(val_acc=v['acc'], val_loss=v['loss'])
-            if v['acc'] > best['acc']:
-                best = dict(acc=v['acc'], epoch=ep + 1,
-                            state=copy.deepcopy(model.state_dict()))
+            if rank == 0:
+                v = evaluate(model, vl, device, args.max_eval_batches)
+                rec.update(val_acc=v['acc'], val_loss=v['loss'])
+                if v['acc'] > best['acc']:
+                    best = dict(acc=v['acc'], epoch=ep + 1,
+                                state=copy.deepcopy(model.state_dict()))
+            if world > 1:
+                dist.barrier()                          # остальные ждут оценку на rank 0
         log.append(rec)
         if tb is not None:
             tb.add_scalar('Loss/train', rec['train_loss'], ep + 1)
@@ -401,7 +446,7 @@ def main():
                 tb.add_scalar('Loss/val', rec['val_loss'], ep + 1)
         print(f"эпоха {ep + 1:4d} | loss {rec['train_loss']:.3f} | lr {rec['lr']:.2e} | "
               f"val {rec.get('val_acc', float('nan')):5.2f}% | {rec['epoch_sec']:.0f} с")
-        if args.ckpt_every and ((ep + 1) % args.ckpt_every == 0) and ep + 1 < epochs:
+        if rank == 0 and args.ckpt_every and ((ep + 1) % args.ckpt_every == 0) and ep + 1 < epochs:
             Path(args.out_dir).mkdir(parents=True, exist_ok=True)
             tmp = last_path.with_suffix('.tmp')
             torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step,
@@ -412,6 +457,11 @@ def main():
                             config=vars(args)), tmp)
             tmp.replace(last_path)                      # атомарно: не испортить при обрыве
     wall = wall_before + time.time() - t0
+    if world > 1:
+        dist.barrier()
+        if rank != 0:                                   # итоговую оценку и запись делает rank 0
+            dist.destroy_process_group()
+            return
     if epochs and last_path.exists():
         last_path.unlink()                              # обучение завершено — продолжать нечего
 
@@ -500,6 +550,8 @@ def main():
             tb.add_scalar(f'LayerError/{fam}_rel_pct', v['rel'], step)
         tb.close()
     print(f'→ {out / (name + ".json")}')
+    if world > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

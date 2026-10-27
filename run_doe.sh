@@ -15,6 +15,7 @@ SPLIT=${SPLIT:-4}
 L=${L:-16384}
 FT_EPOCHS=${FT_EPOCHS:-10}
 PY=${PY:-python}
+NPROC=${NPROC:-1}   # >1: DDP на NPROC карт из GPU (эффективный батч BS·ACC·NPROC)
 EXTRA=${EXTRA:-}   # доп. аргументы main.py (ставятся последними)
 # обучение через оптику со всеми 12 блоками при батче 128 не влезает в 80 ГБ:
 # батч 64 с накоплением 2 (эффективно те же 128)
@@ -24,7 +25,8 @@ mkdir -p "$OUT"
 SEED=${SEED:-1337}
 ST=$([[ "$SEED" == 1337 ]] && echo "" || echo "_s$SEED")   # метка сида
 LT=$([[ "$L" == 16384 ]] && echo "" || echo "_L$L")    # метка линзы в именах файлов
-FIT=${FIT:-$OUT/doe_fit_layer_s$SPLIT$LT.pt}
+DOE_MODE=${DOE_MODE:-layer}   # режим DOE для fit и d0 (layer | shared)
+FIT=${FIT:-$OUT/doe_fit_${DOE_MODE}_s$SPLIT$LT.pt}
 EPOCHS=${EPOCHS:-100}       # обучение с нуля (D5)
 SCR="--epochs $EPOCHS --warmup_epochs 10 --lr 1e-3 --eval_every 5"
 
@@ -38,7 +40,11 @@ FT="--calib_signed $CS --load_ckpt $CK --epochs $FT_EPOCHS --warmup_epochs 1 --l
 run() {   # run <comment> <args...>
   local c="$1"; shift
   echo ">>> [$(date +%H:%M:%S)] $c"
-  CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.main $COMMON "$@" $EXTRA --comment "$c" 2>&1 | tee "$OUT/log_$c.txt"
+  local launcher="$PY"
+  if [[ "$NPROC" -gt 1 ]]; then   # DDP: GPU — список карт через запятую, батч BS — на одну карту
+    launcher="$PY -m torch.distributed.run --standalone --nproc_per_node $NPROC"
+  fi
+  CUDA_VISIBLE_DEVICES=$GPU $launcher -m vit_optica.main $COMMON "$@" $EXTRA --comment "$c" 2>&1 | tee "$OUT/log_$c.txt"
 }
 
 case "${1:-}" in
@@ -46,14 +52,14 @@ case "${1:-}" in
     run probe_nodoe $FT --probe_iters 20
     run probe_doe_layer $FT --doe layer --probe_iters 20 ;;
   fit)     # D0, шаг 1: DOE на ошибку умножения, без сети (минуты)
-    CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe layer --sim_split $SPLIT \
+    CUDA_VISIBLE_DEVICES=$GPU $PY -m vit_optica.doe_fit --doe $DOE_MODE --sim_split $SPLIT \
       --lens_size $L --distance 0.15 --steps 800 --out "$FIT" \
-      2>&1 | tee "$OUT/log_doe_fit$LT.txt" ;;
+      2>&1 | tee "$OUT/log_doe_fit_$DOE_MODE$LT.txt" ;;
   d0)      # D0, шаг 2: инференс цифровых весов без DOE и с подобранным DOE (та же сетка),
            # с прежней калибровкой gain и со знаковой (--calib_signed 1)
     for CS in 0 1; do
       run d0_nodoe_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --calib_signed $CS
-      run d0_fit_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --doe layer --calib_signed $CS \
+      run d0_fit_${DOE_MODE}_cs$CS$LT --eval_only 1 --load_ckpt "$CK" --doe $DOE_MODE --calib_signed $CS \
         --doe_init "$FIT" --doe_freeze 1
     done ;;
   ctrl)    # контроль: дообучение без DOE
