@@ -7,6 +7,7 @@
 #   фазы: probe | fit | d0 | ctrl | d1 | d2 | d3 | d4 | d5_frozen | d5_train | d5_nodoe | d5_clear | d5_digital
 #   другая линза: L=8192 bash run_doe.sh fit, затем L=8192 bash run_doe.sh d0
 set -e
+export PYTHONUNBUFFERED=1   # строки эпох сразу в лог (иначе буфер stdout копится до конца)
 CK=${CK:?"задай CK — цифровой чекпоинт digital_patch_s1337"}
 DATA=${DATA:?"задай DATA — папка с CIFAR-100"}
 GPU=${GPU:-0}
