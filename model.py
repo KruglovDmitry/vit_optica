@@ -126,30 +126,65 @@ class IncoherentSim(nn.Module):
     Вход — мощности светодиодов, правый операнд — пропускание маски, выход — мощность на
     детекторах, корня нет. Отклик маски R зависит только от правого операнда, поэтому для
     статических весов (без градиента, без батча) он кэшируется по содержимому матрицы.
+
+    Матрица больше поля установки режется на блоки не больше поля (как на стенде: маска
+    перезаписывается по частям, частичные суммы складываются в цифре). Все блоки идут
+    через одно и то же устройство, одним вызовом, как батч.
     """
     def __init__(self, mul, cache=True):
         super().__init__()
         self.mul, self.cache = mul, cache
         self._resp = {}
+        cfg = mul.config if hasattr(mul, 'config') else mul.mul.config
+        self.f_in, self.f_out = cfg.n_in, cfg.n_out
 
     @staticmethod
     def _key(Q):
         q = Q.detach().double().flatten()
         return (tuple(Q.shape), q.sum().item(), (q * q).sum().item(), q[::97].sum().item())
 
+    @staticmethod
+    def _grid(n, f):
+        nb = -(-n // f)
+        return nb, -(-n // nb)                       # блоков и размер блока (≤ f, поровну)
+
+    def _blocks(self, P, Q):
+        w, k = Q.shape[-2], Q.shape[-1]
+        if w <= self.f_in and k <= self.f_out:
+            return P, Q, None
+        nw, fw = self._grid(w, self.f_in)
+        nk, fk = self._grid(k, self.f_out)
+        P = F.pad(P, (0, nw * fw - w)).unflatten(-1, (nw, fw)).movedim(-2, -3).unsqueeze(-3)
+        Q = F.pad(Q, (0, nk * fk - k, 0, nw * fw - w))
+        Q = Q.unflatten(-1, (nk, fk)).unflatten(-3, (nw, fw)).movedim(-2, -3)   # (…, nw, nk, fw, fk)
+        return P, Q, k
+
+    @staticmethod
+    def _merge(y, k):
+        if k is None:
+            return y
+        y = y.sum(-4)                                # частичные суммы по блокам входа
+        return y.movedim(-3, -2).flatten(-2)[..., :k]
+
+    def _response(self, Qb):
+        return self.mul.response(Qb)
+
     def forward(self, P, Q):
         static = self.cache and not Q.requires_grad and all(d == 1 for d in Q.shape[:-2])
+        Pb, Qb, k = self._blocks(P, Q)
         if not static:
             if torch.is_grad_enabled() and (P.requires_grad or Q.requires_grad):
                 # Поле на детекторах для обратного прохода не храним, а пересчитываем:
                 # иначе при обучении память растёт на всё поле каждого умножения.
-                return torch.utils.checkpoint.checkpoint(self.mul, P, Q, use_reentrant=False)
-            return self.mul(P, Q)
+                y = torch.utils.checkpoint.checkpoint(self.mul, Pb, Qb, use_reentrant=False)
+            else:
+                y = self.mul(Pb, Qb)
+            return self._merge(y, k)
         key = self._key(Q)
         if key not in self._resp:
             with torch.no_grad():
-                self._resp[key] = self.mul.response(Q)
-        return self.mul(P, Q, response=self._resp[key])
+                self._resp[key] = self._response(Qb)
+        return self._merge(self.mul(Pb, Qb, response=self._resp[key]), k)
 
 
 def inc_split(pitch, na, lam=532e-9):
@@ -159,21 +194,33 @@ def inc_split(pitch, na, lam=532e-9):
 
 def build_inc_sim(device, field, lens_size, distance, pitch=3.6e-6, split=0,
                   lens_pix=1.8e-6, src_fill=1.0, mask_fill=1.0, det_fill=1.0,
-                  src_samples_y=0):
+                  src_samples_y=0, wavelength=532e-9, spectrum=None, lens_glass=None,
+                  src_height=None, devices=None):
+    """
+    spectrum — [(λ, вес), ...] или None; lens_glass — None (ахромат) или имя стекла;
+    devices — source.DeviceConfig (модуляторы, детектор) или None (идеальные устройства).
+    """
     import source
     na = lens_size * lens_pix / 2 / distance
-    split = split or inc_split(pitch, na)
+    lam_min = min(l for l, _ in spectrum) if spectrum else wavelength
+    split = split or inc_split(pitch, na, lam_min)
     cfg = source.IncoherentConfig(
         n_in=field, n_out=field, pitch_x=pitch, split_x=split, split_y=split,
-        src_fill=src_fill, src_height=pitch, src_samples_y=src_samples_y,
-        mask_fill=mask_fill, det_fill=det_fill, distance=distance,
-        lens_pixel_size=lens_pix, lens_size=lens_size)
+        src_fill=src_fill, src_height=src_height or pitch, src_samples_y=src_samples_y,
+        mask_fill=mask_fill, det_fill=det_fill, wavelength=wavelength, spectrum=spectrum,
+        distance=distance, lens_pixel_size=lens_pix, lens_size=lens_size, lens_glass=lens_glass)
     if not src_samples_y:          # 0 = столько точек по высоте светодиода, чтобы растяжка покрыла поле
         cfg.src_samples_y = source.IncoherentOpticalMul.min_src_samples(cfg)
     mul = source.IncoherentOpticalMul(cfg, device=device)
     g = mul.check_grid()
     print(f'Некогерентная схема: поле {field}, элемент {pitch*1e6:.1f} мкм, split {split}, '
-          f'NA {g["na"]:.3f}, u = {g["u_x"]:.2f}, точек светодиода {cfg.src_samples_y}, сетка {"OK" if g["ok"] else "НАРУШЕНА"}')
+          f'NA {g["na"]:.3f}, u = {g["u_x"]:.2f}, точек светодиода {cfg.src_samples_y}, '
+          f'длин волн {len(cfg.spectrum)}, линзы {lens_glass or "ахромат"}, '
+          f'сетка {"OK" if g["ok"] else "НАРУШЕНА"}')
+    if devices is not None:
+        mul = source.IncoherentDevice(mul, devices).to(device)
+        print(f'Устройства: источник {devices.source}, маска {devices.mask}, '
+              f'детектор {devices.detector}, вычитание утечки {devices.subtract_leak}')
     return IncoherentSim(mul).to(device)
 
 

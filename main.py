@@ -24,6 +24,35 @@ from vit_optica import (build_sim, build_inc_sim, OpticContext, ViT, apply_optic
                         DATASET_DEFAULTS, operator_leak_tests, batch_independence_test)
 
 
+def inc_mask_fill(args):
+    fy = args.inc_mask_fill_y
+    return args.inc_mask_fill if fy < 0 else (args.inc_mask_fill, fy)
+
+
+def inc_spectrum(args):
+    if not args.inc_spectrum:
+        return None
+    import source
+    fwhm, n = args.inc_spectrum.split(',')
+    return source.led_spectrum(args.inc_wavelength, float(fwhm), int(n))
+
+
+def inc_devices(args):
+    import source
+    mods = {w: source.ModulatorConfig(levels=getattr(args, f'inc_{w}_levels'),
+                                      gamma=getattr(args, f'inc_{w}_gamma'),
+                                      contrast=getattr(args, f'inc_{w}_contrast'),
+                                      nonuni=getattr(args, f'inc_{w}_nonuni'))
+            for w in ('src', 'mask')}
+    det = source.DetectorConfig(full_well=args.inc_full_well, full_scale=args.inc_full_scale,
+                                read_noise=args.inc_read_noise, adc_bits=args.inc_adc_bits,
+                                background=args.inc_background, frames=args.inc_frames)
+    if mods['src'].ideal and mods['mask'].ideal and det.ideal:
+        return None
+    return source.DeviceConfig(source=mods['src'], mask=mods['mask'], detector=det,
+                               subtract_leak=bool(args.inc_subtract_leak), seed=args.inc_dev_seed)
+
+
 def get_args():
     p = argparse.ArgumentParser()
     a = p.add_argument
@@ -76,6 +105,26 @@ def get_args():
     a('--inc_mask_fill', type=float, default=1.0, help='открытая доля ячейки маски')
     a('--inc_det_fill', type=float, default=1.0, help='доля шага под фотодетектором')
     a('--inc_field', type=int, default=0, help='поле установки (0 = самая широкая матрица модели)')
+    a('--inc_mask_fill_y', type=float, default=-1,
+      help='открытая доля ячейки маски по Y (-1 = как --inc_mask_fill); по X — --inc_mask_fill')
+    a('--inc_src_height', type=float, default=0, help='высота светящейся области источника, м (0 = шаг)')
+    a('--inc_wavelength', type=float, default=532e-9, help='центральная длина волны, м')
+    a('--inc_spectrum', default='', help='спектр LED "fwhm,n" вокруг --inc_wavelength, например "35e-9,5"')
+    a('--inc_glass', default='', help='стекло одиночных линз (N-BK7): фокус зависит от λ; пусто — ахромат')
+    # Слой устройств (source/incoherent_devices.py). Все значения 0 — идеальные устройства.
+    for who, what in (('src', 'источника'), ('mask', 'маски')):
+        a(f'--inc_{who}_levels', type=int, default=0, help=f'уровней модулятора {what} (256 = 8 бит)')
+        a(f'--inc_{who}_gamma', type=float, default=1.0, help=f'гамма LUT модулятора {what}')
+        a(f'--inc_{who}_contrast', type=float, default=0, help=f'контраст модулятора {what} (0 = бесконечный)')
+        a(f'--inc_{who}_nonuni', type=float, default=0, help=f'σ разброса элементов {what}')
+    a('--inc_full_well', type=float, default=0, help='ёмкость детектора, e- (0 = без шума)')
+    a('--inc_full_scale', type=float, default=0.8, help='доля ёмкости под плоское поле (экспозиция)')
+    a('--inc_read_noise', type=float, default=0, help='шум считывания детектора, e-')
+    a('--inc_adc_bits', type=int, default=0, help='разрядность АЦП (0 = без квантования)')
+    a('--inc_background', type=float, default=0, help='рассеянный свет, доля плоского поля')
+    a('--inc_frames', type=int, default=1, help='усредняемых кадров')
+    a('--inc_subtract_leak', type=int, default=1, help='вычитать кадр с закрытой маской')
+    a('--inc_dev_seed', type=int, default=0, help='seed рисунка разброса элементов')
     a('--sim_parallel', type=int, default=0)
     a('--sim_devices', default='')
     a('--check_parallel', type=int, default=1)
@@ -223,7 +272,10 @@ def main():
             field = args.inc_field or widest
             sim = build_inc_sim(device, field, args.lens_size, args.distance,
                                 args.inc_pitch, args.inc_split, args.inc_lens_pix,
-                                args.inc_src_fill, args.inc_mask_fill, args.inc_det_fill)
+                                args.inc_src_fill, inc_mask_fill(args), args.inc_det_fill,
+                                wavelength=args.inc_wavelength, spectrum=inc_spectrum(args),
+                                lens_glass=args.inc_glass or None,
+                                src_height=args.inc_src_height or None, devices=inc_devices(args))
         else:
             field = args.aperture
             sim = build_sim(args.stub_sim, device, args.aperture, args.lens_size,
