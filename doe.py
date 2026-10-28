@@ -58,6 +58,7 @@ class DOESim(FastSim):
         self.register_buffer('_yd', _cs(s4.operator_Y, dev), persistent=False)              # (Nout_y, L)
         self.register_buffer('_lens', _cs(lens_img, dev), persistent=False)                 # (L,)
         del s1, s2, s3, s4
+        self.cfg = cfg
         self._cache = {}
         # для расчётного аподизатора
         self.xi = xl.float()
