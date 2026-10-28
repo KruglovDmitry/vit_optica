@@ -4,7 +4,7 @@
 # поле 32×32 (большие матрицы ViT режутся на блоки), d = 0,1 м, ирис NA 0,02 (апертура 4 мм).
 # Инференс digital_patch_s1337 на CIFAR-100, как run_c100_inc.sh.
 #   DATA_ARGS — аргументы датасета, как в stage1; RUNS — какие прогоны (по умолчанию все);
-#   GPU — номер карты. Пример: GPU=1 RUNS="S0 S4" DATA_ARGS="..." bash run_stand.sh
+#   GPU — номер карты; EXTRA — добавочные аргументы, TAG — суффикс имени прогона. Пример: GPU=1 RUNS="S0 S4" DATA_ARGS="..." bash run_stand.sh
 set -e
 DATA_ARGS=${DATA_ARGS:?"задай DATA_ARGS как в stage1"}
 CK=${CK:-/wd/runs_c100/ckpt_digital_patch_s1337.pt}
@@ -34,5 +34,6 @@ declare -A ARGS=(
   [S5]="$OPT $LCD $DIM"         # всё вместе, света в 10 раз меньше
 )
 for r in $RUNS; do
-  $PY -m vit_optica.main $COMMON ${ARGS[$r]} --comment stand_$r 2>&1 | tee "$OUT/log_stand_$r.txt"
+  $PY -m vit_optica.main $COMMON ${ARGS[$r]} ${EXTRA:-} --comment stand_$r${TAG:-} 2>&1 \
+    | tee "$OUT/log_stand_$r${TAG:-}.txt"
 done
