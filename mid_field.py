@@ -61,7 +61,8 @@ def main():
     def stats(I, ref):
         m = I[inside].mean()
         rip = (I[inside].max() - I[inside].min()) / m
-        out = I[np.abs(xm) > half + 3.6 * 2].max() / ref
+        far = I[np.abs(xm) > half + 3.6 * 2]
+        out = far.max() / ref if far.size else 0.0             # вектор во всю апертуру: края нет
         return m / ref, rip, out
     ref = I0[inside].mean()
     for name, I in (('без DOE', I0), ('с маской', I1)):
